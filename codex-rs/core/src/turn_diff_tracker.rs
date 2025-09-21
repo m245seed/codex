@@ -252,14 +252,6 @@ impl TurnDiffTracker {
     fn get_file_diff(&mut self, internal_file_name: &str) -> String {
         let mut aggregated = String::new();
 
-        // Snapshot lightweight fields only.
-        let (baseline_external_path, baseline_mode, left_oid) = {
-            if let Some(info) = self.baseline_file_info.get(internal_file_name) {
-                (info.path.clone(), info.mode, info.oid.clone())
-            } else {
-                (PathBuf::new(), FileMode::Regular, ZERO_OID.to_string())
-            }
-        };
         let current_external_path = match self.get_path_for_internal(internal_file_name) {
             Some(p) => p,
             None => return aggregated,
@@ -267,6 +259,31 @@ impl TurnDiffTracker {
 
         let current_mode = file_mode_for_path(&current_external_path).unwrap_or(FileMode::Regular);
         let right_bytes = blob_bytes(&current_external_path, &current_mode);
+
+        let (baseline_external_path, baseline_mode, left_oid, unchanged) = {
+            if let Some(info) = self.baseline_file_info.get(internal_file_name) {
+                let left_present = info.oid.as_str() != ZERO_OID;
+                let unchanged = match (left_present, right_bytes.as_deref()) {
+                    (true, Some(rb)) => rb == info.content.as_slice(),
+                    (true, None) => false,
+                    (false, Some(_)) => false,
+                    (false, None) => true,
+                };
+                (info.path.clone(), info.mode, info.oid.clone(), unchanged)
+            } else {
+                let unchanged = right_bytes.is_none();
+                (
+                    PathBuf::new(),
+                    FileMode::Regular,
+                    ZERO_OID.to_string(),
+                    unchanged,
+                )
+            }
+        };
+
+        if unchanged {
+            return aggregated;
+        }
 
         // Compute displays with &mut self before borrowing any baseline content.
         let left_display = self.relative_to_git_root_str(&baseline_external_path);
@@ -293,11 +310,6 @@ impl TurnDiffTracker {
         } else {
             None
         };
-
-        // Fast path: identical bytes or both missing.
-        if left_bytes == right_bytes.as_deref() {
-            return aggregated;
-        }
 
         aggregated.push_str(&format!("diff --git a/{left_display} b/{right_display}\n"));
 

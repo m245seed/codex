@@ -2041,19 +2041,19 @@ async fn try_run_turn(
     prompt: &Prompt,
 ) -> CodexResult<TurnRunResult> {
     // call_ids that are part of this response.
-    let completed_call_ids = prompt
+    let completed_call_ids: HashSet<&str> = prompt
         .input
         .iter()
         .filter_map(|ri| match ri {
-            ResponseItem::FunctionCallOutput { call_id, .. } => Some(call_id),
+            ResponseItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
             ResponseItem::LocalShellCall {
                 call_id: Some(call_id),
                 ..
-            } => Some(call_id),
-            ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
+            } => Some(call_id.as_str()),
+            ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
             _ => None,
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     // call_ids that were pending but are not part of this response.
     // This usually happens because the user interrupted the model before we responded to one of its tool calls
@@ -2072,7 +2072,7 @@ async fn try_run_turn(
                 _ => None,
             })
             .filter_map(|call_id| {
-                if completed_call_ids.contains(&call_id) {
+                if completed_call_ids.contains(call_id.as_str()) {
                     None
                 } else {
                     Some(call_id.clone())

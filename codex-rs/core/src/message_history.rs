@@ -14,11 +14,17 @@
 //! the file descriptor is opened with the `O_APPEND` flag. POSIX guarantees
 //! that writes up to `PIPE_BUF` bytes are atomic in that case.
 
+#[cfg(unix)]
+use once_cell::sync::Lazy;
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Result;
 use std::io::Write;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -48,6 +54,35 @@ pub struct HistoryEntry {
     pub ts: u64,
     pub text: String,
 }
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct HistoryCache {
+    path: PathBuf,
+    entries: Vec<HistoryEntry>,
+    byte_offset: u64,
+}
+
+#[cfg(unix)]
+impl HistoryCache {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            entries: Vec::new(),
+            byte_offset: 0,
+        }
+    }
+
+    fn reset(&mut self, path: PathBuf) {
+        self.path = path;
+        self.entries.clear();
+        self.byte_offset = 0;
+    }
+}
+
+#[cfg(unix)]
+static HISTORY_CACHE: Lazy<Mutex<HashMap<u64, HistoryCache>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn history_filepath(config: &Config) -> PathBuf {
     let mut path = config.codex_home.clone();
@@ -188,12 +223,10 @@ pub(crate) async fn history_metadata(config: &Config) -> (u64, usize) {
 /// locking API.
 #[cfg(unix)]
 pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<HistoryEntry> {
-    use std::io::BufRead;
-    use std::io::BufReader;
     use std::os::unix::fs::MetadataExt;
 
     let path = history_filepath(config);
-    let file: File = match OpenOptions::new().read(true).open(&path) {
+    let mut file: File = match OpenOptions::new().read(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "failed to open history file");
@@ -220,28 +253,28 @@ pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<Hist
 
         match lock_result {
             Ok(()) => {
-                let reader = BufReader::new(&file);
-                for (idx, line_res) in reader.lines().enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to read line from history file");
-                            return None;
-                        }
-                    };
+                let mut cache_guard = match HISTORY_CACHE.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
 
-                    if idx == offset {
-                        match serde_json::from_str::<HistoryEntry>(&line) {
-                            Ok(entry) => return Some(entry),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to parse history entry");
-                                return None;
-                            }
-                        }
-                    }
+                let cache_entry = cache_guard
+                    .entry(log_id)
+                    .or_insert_with(|| HistoryCache::new(path.clone()));
+
+                if cache_entry.path != path || metadata.len() < cache_entry.byte_offset {
+                    cache_entry.reset(path.clone());
                 }
-                // Not found at requested offset.
-                return None;
+
+                let needed = offset + 1;
+                if cache_entry.entries.len() < needed
+                    && let Err(e) = load_history_entries(cache_entry, &mut file, needed)
+                {
+                    tracing::warn!(error = %e, "failed to read history file");
+                    return None;
+                }
+
+                return cache_entry.entries.get(offset).cloned();
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 std::thread::sleep(RETRY_SLEEP);
@@ -254,6 +287,36 @@ pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<Hist
     }
 
     None
+}
+
+#[cfg(unix)]
+fn load_history_entries(
+    cache: &mut HistoryCache,
+    file: &mut File,
+    needed: usize,
+) -> std::io::Result<()> {
+    use std::io::BufRead;
+    use std::io::BufReader;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
+    file.seek(SeekFrom::Start(cache.byte_offset))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = String::new();
+
+    while cache.entries.len() < needed {
+        buf.clear();
+        let read = reader.read_line(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        let line = buf.trim_end_matches(['\n', '\r']);
+        let entry: HistoryEntry = serde_json::from_str(line).map_err(std::io::Error::other)?;
+        cache.byte_offset += read as u64;
+        cache.entries.push(entry);
+    }
+
+    Ok(())
 }
 
 /// Fallback stub for non-Unix systems: currently always returns `None`.
@@ -283,4 +346,103 @@ async fn ensure_owner_only_permissions(file: &File) -> Result<()> {
 async fn ensure_owner_only_permissions(_file: &File) -> Result<()> {
     // For now, on non-Unix, simply succeed.
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::config::ConfigOverrides;
+    use crate::config::ConfigToml;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn reset_history_cache() {
+        if let Ok(mut guard) = HISTORY_CACHE.lock() {
+            guard.clear();
+        }
+    }
+
+    fn write_entries(path: &Path, entries: &[HistoryEntry]) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("create history file: {e}"));
+        for entry in entries {
+            let mut line = serde_json::to_string(entry)
+                .unwrap_or_else(|e| panic!("serialize history entry: {e}"));
+            line.push('\n');
+            file.write_all(line.as_bytes())
+                .unwrap_or_else(|e| panic!("write history entry: {e}"));
+        }
+    }
+
+    #[test]
+    fn sequential_lookups_use_cached_offsets() {
+        reset_history_cache();
+        let codex_home = TempDir::new().unwrap_or_else(|e| panic!("codex home tempdir: {e}"));
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .unwrap_or_else(|e| panic!("default config: {e}"));
+
+        let history_path = history_filepath(&config);
+        let base_entries = vec![
+            HistoryEntry {
+                session_id: "s1".to_string(),
+                ts: 1,
+                text: "first".to_string(),
+            },
+            HistoryEntry {
+                session_id: "s2".to_string(),
+                ts: 2,
+                text: "second".to_string(),
+            },
+            HistoryEntry {
+                session_id: "s3".to_string(),
+                ts: 3,
+                text: "third".to_string(),
+            },
+        ];
+        write_entries(&history_path, &base_entries);
+
+        let log_id = std::fs::metadata(&history_path)
+            .unwrap_or_else(|e| panic!("metadata: {e}"))
+            .ino();
+
+        for (idx, expected) in base_entries.iter().enumerate() {
+            let entry = lookup(log_id, idx, &config).unwrap_or_else(|| panic!("entry for offset"));
+            assert_eq!(entry.session_id, expected.session_id);
+            assert_eq!(entry.ts, expected.ts);
+            assert_eq!(entry.text, expected.text);
+        }
+
+        let new_entry = HistoryEntry {
+            session_id: "s4".to_string(),
+            ts: 4,
+            text: "fourth".to_string(),
+        };
+        let mut append_file = OpenOptions::new()
+            .append(true)
+            .open(&history_path)
+            .unwrap_or_else(|e| panic!("open for append: {e}"));
+        let mut line = serde_json::to_string(&new_entry)
+            .unwrap_or_else(|e| panic!("serialize new entry: {e}"));
+        line.push('\n');
+        append_file
+            .write_all(line.as_bytes())
+            .unwrap_or_else(|e| panic!("append history entry: {e}"));
+
+        let entry = lookup(log_id, base_entries.len(), &config)
+            .unwrap_or_else(|| panic!("entry after append"));
+        assert_eq!(entry.session_id, new_entry.session_id);
+        assert_eq!(entry.ts, new_entry.ts);
+        assert_eq!(entry.text, new_entry.text);
+    }
 }
