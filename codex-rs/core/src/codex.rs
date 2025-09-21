@@ -1404,7 +1404,7 @@ async fn submission_loop(
                 tokio::spawn(async move {
                     // Run lookup in blocking thread because it does file IO + locking.
                     let entry_opt = tokio::task::spawn_blocking(move || {
-                        crate::message_history::lookup(log_id, offset, &config)
+                        crate::message_history::get_history_entry(log_id, offset, &config)
                     })
                     .await
                     .unwrap_or(None);

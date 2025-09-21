@@ -23,6 +23,13 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 
+#[cfg(unix)]
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::sync::Mutex;
+#[cfg(unix)]
+use std::sync::OnceLock;
+
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -47,6 +54,148 @@ pub struct HistoryEntry {
     pub session_id: String,
     pub ts: u64,
     pub text: String,
+}
+
+#[cfg(unix)]
+struct HistoryCache {
+    path: PathBuf,
+    byte_offset: u64,
+    entries: Vec<HistoryEntry>,
+}
+
+#[cfg(unix)]
+static HISTORY_CACHES: OnceLock<Mutex<HashMap<u64, HistoryCache>>> = OnceLock::new();
+
+#[cfg(unix)]
+fn history_cache() -> &'static Mutex<HashMap<u64, HistoryCache>> {
+    HISTORY_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+enum CacheAccessError {
+    Io(std::io::Error),
+    Parse(serde_json::Error),
+    LogIdMismatch,
+}
+
+#[cfg(unix)]
+enum ReadOutcome {
+    Advanced,
+    Eof,
+}
+
+#[cfg(unix)]
+type CacheResult<T> = std::result::Result<T, CacheAccessError>;
+
+#[cfg(unix)]
+impl From<std::io::Error> for CacheAccessError {
+    fn from(error: std::io::Error) -> Self {
+        CacheAccessError::Io(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<serde_json::Error> for CacheAccessError {
+    fn from(error: serde_json::Error) -> Self {
+        CacheAccessError::Parse(error)
+    }
+}
+
+#[cfg(unix)]
+impl HistoryCache {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            byte_offset: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self, path: PathBuf) {
+        self.path = path;
+        self.byte_offset = 0;
+        self.entries.clear();
+    }
+
+    fn entry_at(&mut self, log_id: u64, offset: usize) -> CacheResult<Option<HistoryEntry>> {
+        if offset < self.entries.len() {
+            return Ok(self.entries.get(offset).cloned());
+        }
+
+        self.load_until(log_id, offset)?;
+
+        Ok(self.entries.get(offset).cloned())
+    }
+
+    fn load_until(&mut self, log_id: u64, offset: usize) -> CacheResult<()> {
+        while self.entries.len() <= offset {
+            match self.read_more(log_id, offset)? {
+                ReadOutcome::Advanced => continue,
+                ReadOutcome::Eof => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn read_more(&mut self, log_id: u64, target: usize) -> CacheResult<ReadOutcome> {
+        use std::fs::TryLockError;
+        use std::io::BufRead;
+        use std::io::BufReader;
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        use std::os::unix::fs::MetadataExt;
+
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+
+        let metadata = file.metadata()?;
+        if metadata.ino() != log_id {
+            return Err(CacheAccessError::LogIdMismatch);
+        }
+
+        for _ in 0..MAX_RETRIES {
+            match file.try_lock_shared() {
+                Ok(()) => {
+                    file.seek(SeekFrom::Start(self.byte_offset))?;
+                    let mut reader = BufReader::new(&file);
+                    let mut read_bytes = 0u64;
+                    let mut appended = false;
+
+                    loop {
+                        let mut line = String::new();
+                        let bytes_read = reader.read_line(&mut line)?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+                        read_bytes += bytes_read as u64;
+                        let trimmed = line.trim_end_matches(['\n', '\r']);
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let entry: HistoryEntry = serde_json::from_str(trimmed)?;
+                        self.entries.push(entry);
+                        appended = true;
+                        if self.entries.len() > target {
+                            break;
+                        }
+                    }
+
+                    self.byte_offset += read_bytes;
+                    return Ok(if appended {
+                        ReadOutcome::Advanced
+                    } else {
+                        ReadOutcome::Eof
+                    });
+                }
+                Err(TryLockError::WouldBlock) => std::thread::sleep(RETRY_SLEEP),
+                Err(e) => return Err(CacheAccessError::Io(e.into())),
+            }
+        }
+
+        Err(CacheAccessError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "could not acquire shared lock on history file after multiple attempts",
+        )))
+    }
 }
 
 fn history_filepath(config: &Config) -> PathBuf {
@@ -188,72 +337,56 @@ pub(crate) async fn history_metadata(config: &Config) -> (u64, usize) {
 /// locking API.
 #[cfg(unix)]
 pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<HistoryEntry> {
-    use std::io::BufRead;
-    use std::io::BufReader;
-    use std::os::unix::fs::MetadataExt;
-
     let path = history_filepath(config);
-    let file: File = match OpenOptions::new().read(true).open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to open history file");
-            return None;
+    let cache_mutex = history_cache();
+    let mut caches = cache_mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut remove_entry = false;
+    let result = {
+        let cache = caches
+            .entry(log_id)
+            .or_insert_with(|| HistoryCache::new(path.clone()));
+
+        if cache.path != path {
+            cache.reset(path.clone());
+        }
+
+        match cache.entry_at(log_id, offset) {
+            Ok(Some(entry)) => return Some(entry),
+            Ok(None) => None,
+            Err(CacheAccessError::LogIdMismatch) => {
+                remove_entry = true;
+                None
+            }
+            Err(CacheAccessError::Io(e)) => {
+                tracing::warn!(error = %e, "failed to read history file");
+                remove_entry = true;
+                None
+            }
+            Err(CacheAccessError::Parse(e)) => {
+                tracing::warn!(error = %e, "failed to parse history entry");
+                remove_entry = true;
+                None
+            }
         }
     };
 
-    let metadata = match file.metadata() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to stat history file");
-            return None;
-        }
-    };
-
-    if metadata.ino() != log_id {
-        return None;
+    if remove_entry {
+        caches.remove(&log_id);
     }
 
-    // Open & lock file for reading using a shared lock.
-    // Retry a few times to avoid indefinite blocking.
-    for _ in 0..MAX_RETRIES {
-        let lock_result = file.try_lock_shared();
+    result
+}
 
-        match lock_result {
-            Ok(()) => {
-                let reader = BufReader::new(&file);
-                for (idx, line_res) in reader.lines().enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to read line from history file");
-                            return None;
-                        }
-                    };
-
-                    if idx == offset {
-                        match serde_json::from_str::<HistoryEntry>(&line) {
-                            Ok(entry) => return Some(entry),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to parse history entry");
-                                return None;
-                            }
-                        }
-                    }
-                }
-                // Not found at requested offset.
-                return None;
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                std::thread::sleep(RETRY_SLEEP);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to acquire shared lock on history file");
-                return None;
-            }
-        }
-    }
-
-    None
+#[cfg(unix)]
+pub(crate) fn get_history_entry(
+    log_id: u64,
+    offset: usize,
+    config: &Config,
+) -> Option<HistoryEntry> {
+    lookup(log_id, offset, config)
 }
 
 /// Fallback stub for non-Unix systems: currently always returns `None`.
@@ -263,8 +396,189 @@ pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<Hist
     None
 }
 
+#[cfg(not(unix))]
+pub(crate) fn get_history_entry(
+    log_id: u64,
+    offset: usize,
+    config: &Config,
+) -> Option<HistoryEntry> {
+    let _ = (log_id, offset, config);
+    None
+}
+
 /// On Unix systems ensure the file permissions are `0o600` (rw-------). If the
 /// permissions cannot be changed the error is propagated to the caller.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::config::ConfigOverrides;
+    use crate::config::ConfigToml;
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    fn clear_cache() {
+        super::history_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn load_config(temp: &TempDir) -> Config {
+        Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            temp.path().to_path_buf(),
+        )
+        .expect("load default config for test")
+    }
+
+    fn cache_state(log_id: u64) -> Option<(usize, u64)> {
+        let cache = super::history_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .get(&log_id)
+            .map(|entry| (entry.entries.len(), entry.byte_offset))
+    }
+
+    #[test]
+    fn sequential_offset_requests_extend_cache_incrementally() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().unwrap();
+        let config = load_config(&temp);
+
+        let path = super::history_filepath(&config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let entries = [
+            HistoryEntry {
+                session_id: "session".into(),
+                ts: 1,
+                text: "first".into(),
+            },
+            HistoryEntry {
+                session_id: "session".into(),
+                ts: 2,
+                text: "second".into(),
+            },
+            HistoryEntry {
+                session_id: "session".into(),
+                ts: 3,
+                text: "third".into(),
+            },
+        ];
+
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            for entry in &entries {
+                writeln!(file, "{}", serde_json::to_string(entry).unwrap()).unwrap();
+            }
+        }
+
+        let log_id = std::fs::metadata(&path).unwrap().ino();
+
+        clear_cache();
+
+        let first = super::get_history_entry(log_id, 0, &config).expect("first entry");
+        assert_eq!(first.text, "first");
+
+        let (count_after_first, bytes_after_first) =
+            cache_state(log_id).expect("cache should contain first entry");
+        assert_eq!(count_after_first, 1);
+        assert!(bytes_after_first > 0);
+
+        let second = super::get_history_entry(log_id, 1, &config).expect("second entry");
+        assert_eq!(second.text, "second");
+
+        let (count_after_second, bytes_after_second) =
+            cache_state(log_id).expect("cache should contain second entry");
+        assert_eq!(count_after_second, 2);
+        assert!(bytes_after_second > bytes_after_first);
+
+        let third = super::get_history_entry(log_id, 2, &config).expect("third entry");
+        assert_eq!(third.text, "third");
+
+        let (count_after_third, bytes_after_third) =
+            cache_state(log_id).expect("cache should contain third entry");
+        assert_eq!(count_after_third, 3);
+        assert!(bytes_after_third > bytes_after_second);
+    }
+
+    #[test]
+    fn appended_entries_are_loaded_from_cached_offset() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().unwrap();
+        let config = load_config(&temp);
+
+        let path = super::history_filepath(&config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let initial_entries = [
+            HistoryEntry {
+                session_id: "session".into(),
+                ts: 1,
+                text: "first".into(),
+            },
+            HistoryEntry {
+                session_id: "session".into(),
+                ts: 2,
+                text: "second".into(),
+            },
+        ];
+
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            for entry in &initial_entries {
+                writeln!(file, "{}", serde_json::to_string(entry).unwrap()).unwrap();
+            }
+        }
+
+        let log_id = std::fs::metadata(&path).unwrap().ino();
+
+        clear_cache();
+
+        assert_eq!(
+            super::get_history_entry(log_id, 0, &config).map(|entry| entry.text),
+            Some("first".to_string())
+        );
+        assert_eq!(
+            super::get_history_entry(log_id, 1, &config).map(|entry| entry.text),
+            Some("second".to_string())
+        );
+
+        let (_, bytes_before_append) =
+            cache_state(log_id).expect("cache should contain initial entries");
+
+        let appended = HistoryEntry {
+            session_id: "session".into(),
+            ts: 3,
+            text: "third".into(),
+        };
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{}", serde_json::to_string(&appended).unwrap()).unwrap();
+        }
+
+        let third = super::get_history_entry(log_id, 2, &config).expect("third entry");
+        assert_eq!(third.text, "third");
+
+        let (count_after_append, bytes_after_append) =
+            cache_state(log_id).expect("cache should contain appended entry");
+        assert_eq!(count_after_append, 3);
+        assert!(bytes_after_append > bytes_before_append);
+    }
+}
+
 #[cfg(unix)]
 async fn ensure_owner_only_permissions(file: &File) -> Result<()> {
     let metadata = file.metadata()?;
