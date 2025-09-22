@@ -24,9 +24,6 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
-
-#[cfg(unix)]
-use std::sync::Mutex;
 #[cfg(unix)]
 use std::sync::OnceLock;
 
