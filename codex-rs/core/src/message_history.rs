@@ -15,8 +15,6 @@
 //! that writes up to `PIPE_BUF` bytes are atomic in that case.
 
 #[cfg(unix)]
-use once_cell::sync::Lazy;
-#[cfg(unix)]
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -28,11 +26,6 @@ use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde::Serialize;
-
-#[cfg(unix)]
-use std::collections::HashMap;
-#[cfg(unix)]
-use std::sync::Mutex;
 #[cfg(unix)]
 use std::sync::OnceLock;
 
