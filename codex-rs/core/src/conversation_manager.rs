@@ -166,32 +166,29 @@ impl ConversationManager {
 fn truncate_before_nth_user_message(history: InitialHistory, n: usize) -> InitialHistory {
     // Work directly on rollout items, and cut the vector at the nth user message input.
     let items: Vec<RolloutItem> = history.get_rollout_items();
+    // Track qualifying user messages and short-circuit once the nth (0-based) is located.
+    let mut cut_idx: Option<usize> = None;
+    let mut seen_user = 0usize; // counts qualifying prior user messages (those we keep if we cut later)
 
-    // Find indices of user message inputs in rollout order.
-    let mut user_positions: Vec<usize> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = item
             && role == "user"
             && content_items_to_text(content).is_some_and(|text| !is_session_prefix_message(&text))
         {
-            user_positions.push(idx);
+            // Have we reached the nth user message? (0-based)
+            if seen_user == n { // This is the nth user message; we cut strictly before it.
+                cut_idx = Some(idx);
+                break;
+            }
+            seen_user += 1; // Otherwise, count it and continue.
         }
     }
 
-    // If fewer than or equal to n user messages exist, treat as empty (out of range).
-    if user_positions.len() <= n {
-        return InitialHistory::New;
-    }
+    // If we never found the nth user message, behave like previous implementation: return New.
+    let Some(cut_idx) = cut_idx else { return InitialHistory::New; };
 
-    // Cut strictly before the nth user message (do not keep the nth itself).
-    let cut_idx = user_positions[n];
     let rolled: Vec<RolloutItem> = items.into_iter().take(cut_idx).collect();
-
-    if rolled.is_empty() {
-        InitialHistory::New
-    } else {
-        InitialHistory::Forked(rolled)
-    }
+    if rolled.is_empty() { InitialHistory::New } else { InitialHistory::Forked(rolled) }
 }
 
 #[cfg(test)]

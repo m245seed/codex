@@ -66,12 +66,14 @@ impl TurnDiffTracker {
                     let mode = file_mode_for_path(path);
                     let mode_val = mode.unwrap_or(FileMode::Regular);
                     let content = blob_bytes(path, &mode_val).unwrap_or_default();
+                    // Compute blob id directly from in-memory bytes. For symlinks this already
+                    // represents the target path bytes; for regular/executable files it is the
+                    // file contents. This matches `git hash-object` output. Avoid spawning an
+                    // external `git` process for performance. (If reading failed we already have
+                    // empty content and produce the ZERO_OID later when comparing.)
                     let oid = if mode == Some(FileMode::Symlink) {
                         format!("{:x}", git_blob_sha1_hex_bytes(&content))
-                    } else {
-                        self.git_blob_oid_for_path(path)
-                            .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(&content)))
-                    };
+                    } else { format!("{:x}", git_blob_sha1_hex_bytes(&content)) };
                     Some(BaselineFileInfo {
                         path: path.clone(),
                         content,
@@ -294,8 +296,9 @@ impl TurnDiffTracker {
             if current_mode == FileMode::Symlink {
                 format!("{:x}", git_blob_sha1_hex_bytes(b))
             } else {
-                self.git_blob_oid_for_path(&current_external_path)
-                    .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(b)))
+                // Directly compute the blob id from bytes (same as git would). Avoid invoking
+                // git for each file; fall back to ZERO_OID only if bytes are absent (handled else).
+                format!("{:x}", git_blob_sha1_hex_bytes(b))
             }
         } else {
             ZERO_OID.to_string()

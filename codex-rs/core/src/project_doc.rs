@@ -87,10 +87,17 @@ pub async fn read_project_docs(config: &Config) -> std::io::Result<Option<String
             );
         }
 
-        let text = String::from_utf8_lossy(&data).to_string();
+        // Prefer zero-copy UTF-8 decode; fall back to lossy only on error.
+        let text = match String::from_utf8(data) {
+            Ok(s) => s,
+            Err(e) => {
+                let bytes = e.into_bytes();
+                String::from_utf8_lossy(&bytes).to_string()
+            }
+        };
         if !text.trim().is_empty() {
+            remaining = remaining.saturating_sub(text.as_bytes().len() as u64);
             parts.push(text);
-            remaining = remaining.saturating_sub(data.len() as u64);
         }
     }
 
