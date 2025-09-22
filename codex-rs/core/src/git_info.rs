@@ -113,7 +113,7 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
     get_git_repo_root(cwd)?;
 
     let remotes = get_git_remotes(cwd).await?;
-    let branches = branch_ancestry(cwd).await?;
+    let branches = branch_ancestry(cwd, &remotes).await?;
     let base_sha = find_closest_sha(cwd, &branches, &remotes).await?;
     let diff = diff_against_sha(cwd, &base_sha).await?;
 
@@ -160,9 +160,8 @@ async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {
 /// 1) The symbolic ref at `refs/remotes/<remote>/HEAD` for the first remote (origin prioritized)
 /// 2) `git remote show <remote>` parsed for "HEAD branch: <name>"
 /// 3) Local fallback to existing `main` or `master` if present
-async fn get_default_branch(cwd: &Path) -> Option<String> {
+async fn get_default_branch(cwd: &Path, remotes: &[String]) -> Option<String> {
     // Prefer the first remote (with origin prioritized)
-    let remotes = get_git_remotes(cwd).await.unwrap_or_default();
     for remote in remotes {
         // Try symbolic-ref, which returns something like: refs/remotes/origin/main
         if let Some(symref_output) = run_git_command_with_timeout(
@@ -185,7 +184,7 @@ async fn get_default_branch(cwd: &Path) -> Option<String> {
 
         // Fall back to parsing `git remote show <remote>` output
         if let Some(show_output) =
-            run_git_command_with_timeout(&["remote", "show", &remote], cwd).await
+            run_git_command_with_timeout(&["remote", "show", remote.as_str()], cwd).await
             && show_output.status.success()
             && let Ok(text) = String::from_utf8(show_output.stdout)
         {
@@ -224,7 +223,7 @@ async fn get_default_branch(cwd: &Path) -> Option<String> {
 
 /// Build an ancestry of branches starting at the current branch and ending at the
 /// repository's default branch (if determinable)..
-async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
+async fn branch_ancestry(cwd: &Path, remotes: &[String]) -> Option<Vec<String>> {
     // Discover current branch (ignore detached HEAD by treating it as None)
     let current_branch = run_git_command_with_timeout(&["rev-parse", "--abbrev-ref", "HEAD"], cwd)
         .await
@@ -239,7 +238,7 @@ async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
         .filter(|s| s != "HEAD");
 
     // Discover default branch
-    let default_branch = get_default_branch(cwd).await;
+    let default_branch = get_default_branch(cwd, remotes).await;
 
     let mut ancestry: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -258,7 +257,6 @@ async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
     // This addresses cases where we're on a new local-only branch forked from a
     // remote branch that isn't the repository default. We prioritize remotes in
     // the order returned by get_git_remotes (origin first).
-    let remotes = get_git_remotes(cwd).await.unwrap_or_default();
     for remote in remotes {
         if let Some(output) = run_git_command_with_timeout(
             &[

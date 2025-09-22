@@ -15,26 +15,20 @@
 //! that writes up to `PIPE_BUF` bytes are atomic in that case.
 
 #[cfg(unix)]
-use once_cell::sync::Lazy;
-#[cfg(unix)]
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Result;
 use std::io::Write;
 use std::path::PathBuf;
-#[cfg(unix)]
-use std::sync::Mutex;
 
-use serde::Deserialize;
-use serde::Serialize;
-
-#[cfg(unix)]
-use std::collections::HashMap;
 #[cfg(unix)]
 use std::sync::Mutex;
 #[cfg(unix)]
 use std::sync::OnceLock;
+
+use serde::Deserialize;
+use serde::Serialize;
 
 use std::time::Duration;
 use tokio::fs;
@@ -445,7 +439,7 @@ pub(crate) fn get_history_entry(
 /// On Unix systems ensure the file permissions are `0o600` (rw-------). If the
 /// permissions cannot be changed the error is propagated to the caller.
 #[cfg(all(test, unix))]
-mod tests {
+mod permissions_tests {
     use super::*;
     use crate::config::Config;
     use crate::config::ConfigOverrides;
@@ -647,7 +641,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn reset_history_cache() {
-        if let Ok(mut guard) = HISTORY_CACHE.lock() {
+        let cache = super::history_cache();
+        if let Ok(mut guard) = cache.lock() {
             guard.clear();
         }
     }

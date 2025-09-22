@@ -65,12 +65,20 @@ impl TurnDiffTracker {
                 let baseline_file_info = if path.exists() {
                     let mode = file_mode_for_path(path);
                     let mode_val = mode.unwrap_or(FileMode::Regular);
-                    let content = blob_bytes(path, &mode_val).unwrap_or_default();
-                    let oid = if mode == Some(FileMode::Symlink) {
-                        format!("{:x}", git_blob_sha1_hex_bytes(&content))
-                    } else {
-                        self.git_blob_oid_for_path(path)
-                            .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(&content)))
+                    let (content, oid) = match blob_bytes(path, &mode_val) {
+                        Some(content) => {
+                            let bytes = content.as_slice();
+                            let oid = self
+                                .git_blob_oid_for_path(path, Some(bytes))
+                                .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(bytes)));
+                            (content, oid)
+                        }
+                        None => {
+                            let oid = self
+                                .git_blob_oid_for_path(path, None)
+                                .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(&[])));
+                            (Vec::new(), oid)
+                        }
                     };
                     Some(BaselineFileInfo {
                         path: path.clone(),
@@ -198,9 +206,13 @@ impl TurnDiffTracker {
         s.replace('\\', "/")
     }
 
-    /// Ask git to compute the blob SHA-1 for the file at `path` within its repository.
-    /// Returns None if no repository is found or git invocation fails.
-    fn git_blob_oid_for_path(&mut self, path: &Path) -> Option<String> {
+    /// Compute the blob SHA-1 for the file at `path`.
+    /// If `bytes` is provided the hash is derived directly without invoking git.
+    /// Returns None if no repository is found or git invocation fails when falling back to git.
+    fn git_blob_oid_for_path(&mut self, path: &Path, bytes: Option<&[u8]>) -> Option<String> {
+        if let Some(data) = bytes {
+            return Some(format!("{:x}", git_blob_sha1_hex_bytes(data)));
+        }
         let root = self.find_git_root_cached(path)?;
         // Compute a path relative to the repo root for better portability across platforms.
         let rel = path.strip_prefix(&root).unwrap_or(path);
@@ -291,12 +303,9 @@ impl TurnDiffTracker {
 
         // Compute right oid before borrowing baseline content.
         let right_oid = if let Some(b) = right_bytes.as_ref() {
-            if current_mode == FileMode::Symlink {
-                format!("{:x}", git_blob_sha1_hex_bytes(b))
-            } else {
-                self.git_blob_oid_for_path(&current_external_path)
-                    .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(b)))
-            }
+            let bytes = b.as_slice();
+            self.git_blob_oid_for_path(&current_external_path, Some(bytes))
+                .unwrap_or_else(|| format!("{:x}", git_blob_sha1_hex_bytes(bytes)))
         } else {
             ZERO_OID.to_string()
         };

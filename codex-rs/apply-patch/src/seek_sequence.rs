@@ -93,10 +93,16 @@ pub(crate) fn seek_sequence(
             .collect::<String>()
     }
 
+    let normalised_pattern: Vec<String> = pattern.iter().map(|pat| normalise(pat)).collect();
+    let mut normalised_lines: Vec<Option<String>> = vec![None; lines.len()];
+
     for i in search_start..=lines.len().saturating_sub(pattern.len()) {
         let mut ok = true;
-        for (p_idx, pat) in pattern.iter().enumerate() {
-            if normalise(&lines[i + p_idx]) != normalise(pat) {
+        for (p_idx, normalised_pat) in normalised_pattern.iter().enumerate() {
+            let line_idx = i + p_idx;
+            let normalised_line =
+                normalised_lines[line_idx].get_or_insert_with(|| normalise(&lines[line_idx]));
+            if normalised_line.as_str() != normalised_pat {
                 ok = false;
                 break;
             }
@@ -146,5 +152,12 @@ mod tests {
         let pattern = to_vec(&["too", "many", "lines"]);
         // Should not panic – must return None when pattern cannot possibly fit.
         assert_eq!(seek_sequence(&lines, &pattern, 0, false), None);
+    }
+
+    #[test]
+    fn test_normalised_match_maps_unicode_punctuation() {
+        let lines = to_vec(&["“Quote” – dash"]);
+        let pattern = to_vec(&["\"Quote\" - dash"]);
+        assert_eq!(seek_sequence(&lines, &pattern, 0, false), Some(0));
     }
 }
