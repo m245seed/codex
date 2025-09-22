@@ -15,22 +15,16 @@
 //! that writes up to `PIPE_BUF` bytes are atomic in that case.
 
 #[cfg(unix)]
-use once_cell::sync::Lazy;
-#[cfg(unix)]
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Result;
 use std::io::Write;
 use std::path::PathBuf;
-#[cfg(unix)]
-use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde::Serialize;
 
-#[cfg(unix)]
-use std::collections::HashMap;
 #[cfg(unix)]
 use std::sync::Mutex;
 #[cfg(unix)]
@@ -395,36 +389,6 @@ pub(crate) fn get_history_entry(
     lookup(log_id, offset, config)
 }
 
-#[cfg(unix)]
-fn load_history_entries(
-    cache: &mut HistoryCache,
-    file: &mut File,
-    needed: usize,
-) -> std::io::Result<()> {
-    use std::io::BufRead;
-    use std::io::BufReader;
-    use std::io::Seek;
-    use std::io::SeekFrom;
-
-    file.seek(SeekFrom::Start(cache.byte_offset))?;
-    let mut reader = BufReader::new(file);
-    let mut buf = String::new();
-
-    while cache.entries.len() < needed {
-        buf.clear();
-        let read = reader.read_line(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        let line = buf.trim_end_matches(['\n', '\r']);
-        let entry: HistoryEntry = serde_json::from_str(line).map_err(std::io::Error::other)?;
-        cache.byte_offset += read as u64;
-        cache.entries.push(entry);
-    }
-
-    Ok(())
-}
-
 /// Fallback stub for non-Unix systems: currently always returns `None`.
 #[cfg(not(unix))]
 pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<HistoryEntry> {
@@ -466,7 +430,7 @@ mod tests {
             ConfigOverrides::default(),
             temp.path().to_path_buf(),
         )
-        .expect("load default config for test")
+        .unwrap_or_else(|e| panic!("load default config for test: {e}"))
     }
 
     fn cache_state(log_id: u64) -> Option<(usize, u64)> {
@@ -519,27 +483,30 @@ mod tests {
 
         clear_cache();
 
-        let first = super::get_history_entry(log_id, 0, &config).expect("first entry");
+        let first =
+            super::get_history_entry(log_id, 0, &config).unwrap_or_else(|| panic!("first entry"));
         assert_eq!(first.text, "first");
 
         let (count_after_first, bytes_after_first) =
-            cache_state(log_id).expect("cache should contain first entry");
+            cache_state(log_id).unwrap_or_else(|| panic!("cache should contain first entry"));
         assert_eq!(count_after_first, 1);
         assert!(bytes_after_first > 0);
 
-        let second = super::get_history_entry(log_id, 1, &config).expect("second entry");
+        let second =
+            super::get_history_entry(log_id, 1, &config).unwrap_or_else(|| panic!("second entry"));
         assert_eq!(second.text, "second");
 
         let (count_after_second, bytes_after_second) =
-            cache_state(log_id).expect("cache should contain second entry");
+            cache_state(log_id).unwrap_or_else(|| panic!("cache should contain second entry"));
         assert_eq!(count_after_second, 2);
         assert!(bytes_after_second > bytes_after_first);
 
-        let third = super::get_history_entry(log_id, 2, &config).expect("third entry");
+        let third =
+            super::get_history_entry(log_id, 2, &config).unwrap_or_else(|| panic!("third entry"));
         assert_eq!(third.text, "third");
 
         let (count_after_third, bytes_after_third) =
-            cache_state(log_id).expect("cache should contain third entry");
+            cache_state(log_id).unwrap_or_else(|| panic!("cache should contain third entry"));
         assert_eq!(count_after_third, 3);
         assert!(bytes_after_third > bytes_after_second);
     }
@@ -589,7 +556,7 @@ mod tests {
         );
 
         let (_, bytes_before_append) =
-            cache_state(log_id).expect("cache should contain initial entries");
+            cache_state(log_id).unwrap_or_else(|| panic!("cache should contain initial entries"));
 
         let appended = HistoryEntry {
             session_id: "session".into(),
@@ -605,11 +572,12 @@ mod tests {
             writeln!(file, "{}", serde_json::to_string(&appended).unwrap()).unwrap();
         }
 
-        let third = super::get_history_entry(log_id, 2, &config).expect("third entry");
+        let third =
+            super::get_history_entry(log_id, 2, &config).unwrap_or_else(|| panic!("third entry"));
         assert_eq!(third.text, "third");
 
         let (count_after_append, bytes_after_append) =
-            cache_state(log_id).expect("cache should contain appended entry");
+            cache_state(log_id).unwrap_or_else(|| panic!("cache should contain appended entry"));
         assert_eq!(count_after_append, 3);
         assert!(bytes_after_append > bytes_before_append);
     }
@@ -633,103 +601,4 @@ async fn ensure_owner_only_permissions(file: &File) -> Result<()> {
 async fn ensure_owner_only_permissions(_file: &File) -> Result<()> {
     // For now, on non-Unix, simply succeed.
     Ok(())
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use crate::config::ConfigOverrides;
-    use crate::config::ConfigToml;
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
-    use tempfile::TempDir;
-
-    fn reset_history_cache() {
-        if let Ok(mut guard) = HISTORY_CACHE.lock() {
-            guard.clear();
-        }
-    }
-
-    fn write_entries(path: &Path, entries: &[HistoryEntry]) {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
-            .unwrap_or_else(|e| panic!("create history file: {e}"));
-        for entry in entries {
-            let mut line = serde_json::to_string(entry)
-                .unwrap_or_else(|e| panic!("serialize history entry: {e}"));
-            line.push('\n');
-            file.write_all(line.as_bytes())
-                .unwrap_or_else(|e| panic!("write history entry: {e}"));
-        }
-    }
-
-    #[test]
-    fn sequential_lookups_use_cached_offsets() {
-        reset_history_cache();
-        let codex_home = TempDir::new().unwrap_or_else(|e| panic!("codex home tempdir: {e}"));
-        let config = Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            codex_home.path().to_path_buf(),
-        )
-        .unwrap_or_else(|e| panic!("default config: {e}"));
-
-        let history_path = history_filepath(&config);
-        let base_entries = vec![
-            HistoryEntry {
-                session_id: "s1".to_string(),
-                ts: 1,
-                text: "first".to_string(),
-            },
-            HistoryEntry {
-                session_id: "s2".to_string(),
-                ts: 2,
-                text: "second".to_string(),
-            },
-            HistoryEntry {
-                session_id: "s3".to_string(),
-                ts: 3,
-                text: "third".to_string(),
-            },
-        ];
-        write_entries(&history_path, &base_entries);
-
-        let log_id = std::fs::metadata(&history_path)
-            .unwrap_or_else(|e| panic!("metadata: {e}"))
-            .ino();
-
-        for (idx, expected) in base_entries.iter().enumerate() {
-            let entry = lookup(log_id, idx, &config).unwrap_or_else(|| panic!("entry for offset"));
-            assert_eq!(entry.session_id, expected.session_id);
-            assert_eq!(entry.ts, expected.ts);
-            assert_eq!(entry.text, expected.text);
-        }
-
-        let new_entry = HistoryEntry {
-            session_id: "s4".to_string(),
-            ts: 4,
-            text: "fourth".to_string(),
-        };
-        let mut append_file = OpenOptions::new()
-            .append(true)
-            .open(&history_path)
-            .unwrap_or_else(|e| panic!("open for append: {e}"));
-        let mut line = serde_json::to_string(&new_entry)
-            .unwrap_or_else(|e| panic!("serialize new entry: {e}"));
-        line.push('\n');
-        append_file
-            .write_all(line.as_bytes())
-            .unwrap_or_else(|e| panic!("append history entry: {e}"));
-
-        let entry = lookup(log_id, base_entries.len(), &config)
-            .unwrap_or_else(|| panic!("entry after append"));
-        assert_eq!(entry.session_id, new_entry.session_id);
-        assert_eq!(entry.ts, new_entry.ts);
-        assert_eq!(entry.text, new_entry.text);
-    }
 }

@@ -2041,16 +2041,16 @@ async fn try_run_turn(
     prompt: &Prompt,
 ) -> CodexResult<TurnRunResult> {
     // call_ids that are part of this response.
-    let completed_call_ids: HashSet<&str> = prompt
+    let completed_call_ids: HashSet<&String> = prompt
         .input
         .iter()
         .filter_map(|ri| match ri {
-            ResponseItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            ResponseItem::FunctionCallOutput { call_id, .. } => Some(call_id),
             ResponseItem::LocalShellCall {
                 call_id: Some(call_id),
                 ..
-            } => Some(call_id.as_str()),
-            ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+            } => Some(call_id),
+            ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
             _ => None,
         })
         .collect();
@@ -2071,13 +2071,8 @@ async fn try_run_turn(
                 ResponseItem::CustomToolCall { call_id, .. } => Some(call_id),
                 _ => None,
             })
-            .filter_map(|call_id| {
-                if completed_call_ids.contains(call_id.as_str()) {
-                    None
-                } else {
-                    Some(call_id.clone())
-                }
-            })
+            .filter(|call_id| !completed_call_ids.contains(call_id))
+            .cloned()
             .map(|call_id| ResponseItem::CustomToolCallOutput {
                 call_id,
                 output: "aborted".to_string(),
