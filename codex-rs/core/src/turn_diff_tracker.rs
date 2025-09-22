@@ -73,7 +73,9 @@ impl TurnDiffTracker {
                     // empty content and produce the ZERO_OID later when comparing.)
                     let oid = if mode == Some(FileMode::Symlink) {
                         format!("{:x}", git_blob_sha1_hex_bytes(&content))
-                    } else { format!("{:x}", git_blob_sha1_hex_bytes(&content)) };
+                    } else {
+                        format!("{:x}", git_blob_sha1_hex_bytes(&content))
+                    };
                     Some(BaselineFileInfo {
                         path: path.clone(),
                         content,

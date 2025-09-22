@@ -176,7 +176,8 @@ fn truncate_before_nth_user_message(history: InitialHistory, n: usize) -> Initia
             && content_items_to_text(content).is_some_and(|text| !is_session_prefix_message(&text))
         {
             // Have we reached the nth user message? (0-based)
-            if seen_user == n { // This is the nth user message; we cut strictly before it.
+            if seen_user == n {
+                // This is the nth user message; we cut strictly before it.
                 cut_idx = Some(idx);
                 break;
             }
@@ -185,10 +186,16 @@ fn truncate_before_nth_user_message(history: InitialHistory, n: usize) -> Initia
     }
 
     // If we never found the nth user message, behave like previous implementation: return New.
-    let Some(cut_idx) = cut_idx else { return InitialHistory::New; };
+    let Some(cut_idx) = cut_idx else {
+        return InitialHistory::New;
+    };
 
     let rolled: Vec<RolloutItem> = items.into_iter().take(cut_idx).collect();
-    if rolled.is_empty() { InitialHistory::New } else { InitialHistory::Forked(rolled) }
+    if rolled.is_empty() {
+        InitialHistory::New
+    } else {
+        InitialHistory::Forked(rolled)
+    }
 }
 
 #[cfg(test)]
