@@ -1,13 +1,10 @@
 use std::time::Duration;
-
 use rand::Rng;
 
 const INITIAL_DELAY_MS: u64 = 200;
-const BACKOFF_FACTOR: f64 = 2.0;
 
 pub(crate) fn backoff(attempt: u64) -> Duration {
-    let exp = BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);
-    let base = (INITIAL_DELAY_MS as f64 * exp) as u64;
-    let jitter = rand::rng().random_range(0.9..1.1);
-    Duration::from_millis((base as f64 * jitter) as u64)
+    let base = INITIAL_DELAY_MS << attempt.saturating_sub(1).min(10); // Cap at 2^10 to prevent overflow
+    let jitter_factor = rand::rng().random_range(90..=110); // 0.9 to 1.1 as percentage
+    Duration::from_millis(base * jitter_factor / 100)
 }

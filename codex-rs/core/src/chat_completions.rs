@@ -1,19 +1,12 @@
-use std::time::Duration;
+use std::{collections::{HashMap, VecDeque}, pin::Pin, task::{Context, Poll}, time::Duration};
 
 use bytes::Bytes;
 use eventsource_stream::Eventsource;
-use futures::Stream;
-use futures::StreamExt;
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::StatusCode;
 use serde_json::json;
-use std::pin::Pin;
-use std::task::Context;
-use std::task::Poll;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
-use tracing::debug;
-use tracing::trace;
+use tokio::{sync::mpsc, time::timeout};
+use tracing::{debug, trace};
 
 use crate::ModelProviderInfo;
 use crate::client_common::Prompt;
@@ -48,8 +41,7 @@ pub(crate) async fn stream_chat_completions(
     // - Otherwise, for each Reasoning item after the last user message, attach it
     //   to the immediate previous assistant message (stop turns) or the immediate
     //   next assistant anchor (tool-call turns: function/local shell call, or assistant message).
-    let mut reasoning_by_anchor_index: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
+    let mut reasoning_by_anchor_index = HashMap::<usize, String>::new();
 
     // Determine the last role that would be emitted to Chat Completions.
     let mut last_emitted_role: Option<&str> = None;
@@ -92,47 +84,34 @@ pub(crate) async fn stream_chat_completions(
                 ..
             } = item
             {
-                let mut text = String::new();
-                for c in items {
-                    match c {
-                        ReasoningItemContent::ReasoningText { text: t }
-                        | ReasoningItemContent::Text { text: t } => text.push_str(t),
-                    }
-                }
+                let text = items.iter()
+                    .filter_map(|c| match c {
+                        ReasoningItemContent::ReasoningText { text } | 
+                        ReasoningItemContent::Text { text } => Some(text.as_str())
+                    })
+                    .collect::<String>();
+                
                 if text.trim().is_empty() {
                     continue;
                 }
 
-                // Prefer immediate previous assistant message (stop turns)
-                let mut attached = false;
-                if idx > 0
-                    && let ResponseItem::Message { role, .. } = &input[idx - 1]
-                    && role == "assistant"
-                {
-                    reasoning_by_anchor_index
-                        .entry(idx - 1)
-                        .and_modify(|v| v.push_str(&text))
-                        .or_insert(text.clone());
-                    attached = true;
-                }
-
-                // Otherwise, attach to immediate next assistant anchor (tool-calls or assistant message)
-                if !attached && idx + 1 < input.len() {
+                // Attach to previous assistant message or next assistant anchor
+                let anchor_idx = if idx > 0 && matches!(&input[idx - 1], ResponseItem::Message { role, .. } if role == "assistant") {
+                    Some(idx - 1)
+                } else if idx + 1 < input.len() {
                     match &input[idx + 1] {
-                        ResponseItem::FunctionCall { .. } | ResponseItem::LocalShellCall { .. } => {
-                            reasoning_by_anchor_index
-                                .entry(idx + 1)
-                                .and_modify(|v| v.push_str(&text))
-                                .or_insert(text.clone());
-                        }
-                        ResponseItem::Message { role, .. } if role == "assistant" => {
-                            reasoning_by_anchor_index
-                                .entry(idx + 1)
-                                .and_modify(|v| v.push_str(&text))
-                                .or_insert(text.clone());
-                        }
-                        _ => {}
+                        ResponseItem::FunctionCall { .. } | ResponseItem::LocalShellCall { .. } |
+                        ResponseItem::Message { role, .. } if role == "assistant" => Some(idx + 1),
+                        _ => None
                     }
+                } else {
+                    None
+                };
+                
+                if let Some(anchor) = anchor_idx {
+                    reasoning_by_anchor_index.entry(anchor)
+                        .and_modify(|v| v.push_str(&text))
+                        .or_insert(text);
                 }
             }
         }
@@ -146,21 +125,15 @@ pub(crate) async fn stream_chat_completions(
     for (idx, item) in input.iter().enumerate() {
         match item {
             ResponseItem::Message { role, content, .. } => {
-                let mut text = String::new();
-                for c in content {
-                    match c {
-                        ContentItem::InputText { text: t }
-                        | ContentItem::OutputText { text: t } => {
-                            text.push_str(t);
-                        }
-                        _ => {}
-                    }
-                }
-                // Skip exact-duplicate assistant messages.
+                let text = content.iter()
+                    .filter_map(|c| match c {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text.as_str())
+                    })
+                    .collect::<String>();
+                
+                // Skip duplicate assistant messages
                 if role == "assistant" {
-                    if let Some(prev) = &last_assistant_text
-                        && prev == &text
-                    {
+                    if last_assistant_text.as_ref() == Some(&text) {
                         continue;
                     }
                     last_assistant_text = Some(text.clone());
@@ -211,7 +184,7 @@ pub(crate) async fn stream_chat_completions(
                     "role": "assistant",
                     "content": null,
                     "tool_calls": [{
-                        "id": id.clone().unwrap_or_else(|| "".to_string()),
+                        "id": id.as_deref().unwrap_or(""),
                         "type": "local_shell_call",
                         "status": status,
                         "action": action,
@@ -564,9 +537,9 @@ async fn process_chat_sse<S>(
                         // Then emit the FunctionCall response item.
                         let item = ResponseItem::FunctionCall {
                             id: None,
-                            name: fn_call_state.name.clone().unwrap_or_else(|| "".to_string()),
-                            arguments: fn_call_state.arguments.clone(),
-                            call_id: fn_call_state.call_id.clone().unwrap_or_else(String::new),
+                            name: fn_call_state.name.take().unwrap_or_default(),
+                            arguments: std::mem::take(&mut fn_call_state.arguments),
+                            call_id: fn_call_state.call_id.take().unwrap_or_default(),
                         };
 
                         let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
@@ -642,7 +615,7 @@ pub(crate) struct AggregatedChatStream<S> {
     inner: S,
     cumulative: String,
     cumulative_reasoning: String,
-    pending: std::collections::VecDeque<ResponseEvent>,
+    pending: VecDeque<ResponseEvent>,
     mode: AggregateMode,
 }
 
@@ -681,19 +654,14 @@ where
                                 // Only use the final assistant message if we have not
                                 // seen any deltas; otherwise, deltas already built the
                                 // cumulative text and this would duplicate it.
-                                if this.cumulative.is_empty()
-                                    && let codex_protocol::models::ResponseItem::Message {
-                                        content,
-                                        ..
-                                    } = &item
-                                    && let Some(text) = content.iter().find_map(|c| match c {
-                                        codex_protocol::models::ContentItem::OutputText {
-                                            text,
-                                        } => Some(text),
-                                        _ => None,
-                                    })
-                                {
-                                    this.cumulative.push_str(text);
+                                if this.cumulative.is_empty() {
+                                    if let codex_protocol::models::ResponseItem::Message { content, .. } = &item {
+                                        for c in content {
+                                            if let codex_protocol::models::ContentItem::OutputText { text } = c {
+                                                this.cumulative.push_str(text);
+                                            }
+                                        }
+                                    }
                                 }
                                 // Swallow assistant message here; emit on Completed.
                                 continue;
@@ -854,7 +822,7 @@ impl<S> AggregatedChatStream<S> {
             inner,
             cumulative: String::new(),
             cumulative_reasoning: String::new(),
-            pending: std::collections::VecDeque::new(),
+            pending: VecDeque::new(),
             mode,
         }
     }

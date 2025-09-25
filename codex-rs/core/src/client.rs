@@ -1,54 +1,46 @@
-use std::io::BufRead;
-use std::path::Path;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::{
+    io::BufRead,
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
-use crate::AuthManager;
+use crate::{
+    AuthManager,
+    chat_completions::{AggregateStreamExt, stream_chat_completions},
+    client_common::{
+        Prompt, ResponseEvent, ResponseStream, ResponsesApiRequest,
+        create_reasoning_param_for_request, create_text_param_for_request,
+    },
+    config::Config,
+    default_client::create_client,
+    error::{CodexErr, Result, UsageLimitReachedError},
+    flags::CODEX_RS_SSE_FIXTURE,
+    model_family::ModelFamily,
+    model_provider_info::{ModelProviderInfo, WireApi},
+    openai_model_info::get_model_info,
+    openai_tools::create_tools_json_for_responses_api,
+    protocol::{RateLimitSnapshotEvent, TokenUsage},
+    token_data::PlanType,
+    util::backoff,
+};
 use bytes::Bytes;
-use codex_protocol::mcp_protocol::AuthMode;
-use codex_protocol::mcp_protocol::ConversationId;
+use codex_protocol::{
+    config_types::{ReasoningEffort as ReasoningEffortConfig, ReasoningSummary as ReasoningSummaryConfig},
+    mcp_protocol::{AuthMode, ConversationId},
+    models::ResponseItem,
+};
 use eventsource_stream::Eventsource;
 use futures::prelude::*;
 use regex_lite::Regex;
-use reqwest::StatusCode;
-use reqwest::header::HeaderMap;
-use serde::Deserialize;
-use serde::Serialize;
+use reqwest::{StatusCode, header::HeaderMap};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::{sync::mpsc, time::timeout};
 use tokio_util::io::ReaderStream;
-use tracing::debug;
-use tracing::trace;
-use tracing::warn;
+use tracing::{debug, trace, warn};
 
-use crate::chat_completions::AggregateStreamExt;
-use crate::chat_completions::stream_chat_completions;
-use crate::client_common::Prompt;
-use crate::client_common::ResponseEvent;
-use crate::client_common::ResponseStream;
-use crate::client_common::ResponsesApiRequest;
-use crate::client_common::create_reasoning_param_for_request;
-use crate::client_common::create_text_param_for_request;
-use crate::config::Config;
-use crate::default_client::create_client;
-use crate::error::CodexErr;
-use crate::error::Result;
-use crate::error::UsageLimitReachedError;
-use crate::flags::CODEX_RS_SSE_FIXTURE;
-use crate::model_family::ModelFamily;
-use crate::model_provider_info::ModelProviderInfo;
-use crate::model_provider_info::WireApi;
-use crate::openai_model_info::get_model_info;
-use crate::openai_tools::create_tools_json_for_responses_api;
-use crate::protocol::RateLimitSnapshotEvent;
-use crate::protocol::TokenUsage;
-use crate::token_data::PlanType;
-use crate::util::backoff;
-use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use codex_protocol::models::ResponseItem;
-use std::sync::Arc;
+
 
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
@@ -174,10 +166,10 @@ impl ModelClient {
             self.summary,
         );
 
-        let include: Vec<String> = if reasoning.is_some() {
-            vec!["reasoning.encrypted_content".to_string()]
+        let include: &[&str] = if reasoning.is_some() {
+            &["reasoning.encrypted_content"]
         } else {
-            vec![]
+            &[]
         };
 
         let input_with_instructions = prompt.get_formatted_input();
@@ -305,25 +297,16 @@ impl ModelClient {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok());
 
-                    if status == StatusCode::UNAUTHORIZED
-                        && let Some(manager) = auth_manager.as_ref()
-                        && manager.auth().is_some()
-                    {
-                        let _ = manager.refresh_token().await;
+                    if status == StatusCode::UNAUTHORIZED {
+                        if let Some(manager) = auth_manager.as_ref() {
+                            if manager.auth().is_some() {
+                                let _ = manager.refresh_token().await;
+                            }
+                        }
                     }
 
-                    // The OpenAI Responses endpoint returns structured JSON bodies even for 4xx/5xx
-                    // errors. When we bubble early with only the HTTP status the caller sees an opaque
-                    // "unexpected status 400 Bad Request" which makes debugging nearly impossible.
-                    // Instead, read (and include) the response text so higher layers and users see the
-                    // exact error message (e.g. "Unknown parameter: 'input[0].metadata'"). The body is
-                    // small and this branch only runs on error paths so the extra allocation is
-                    // negligible.
-                    if !(status == StatusCode::TOO_MANY_REQUESTS
-                        || status == StatusCode::UNAUTHORIZED
-                        || status.is_server_error())
-                    {
-                        // Surface the error body to callers. Use `unwrap_or_default` per Clippy.
+                    // Handle non-retryable errors immediately
+                    if !matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::UNAUTHORIZED) && !status.is_server_error() {
                         let body = res.text().await.unwrap_or_default();
                         return Err(CodexErr::UnexpectedStatus(status, body));
                     }
@@ -373,18 +356,18 @@ impl ModelClient {
         }
     }
 
-    pub fn get_provider(&self) -> ModelProviderInfo {
-        self.provider.clone()
+    pub fn get_provider(&self) -> &ModelProviderInfo {
+        &self.provider
     }
 
     /// Returns the currently configured model slug.
-    pub fn get_model(&self) -> String {
-        self.config.model.clone()
+    pub fn get_model(&self) -> &str {
+        &self.config.model
     }
 
     /// Returns the currently configured model family.
-    pub fn get_model_family(&self) -> ModelFamily {
-        self.config.model_family.clone()
+    pub fn get_model_family(&self) -> &ModelFamily {
+        &self.config.model_family
     }
 
     /// Returns the current reasoning effort setting.
@@ -502,14 +485,12 @@ fn parse_rate_limit_snapshot(headers: &HeaderMap) -> Option<RateLimitSnapshotEve
 }
 
 fn parse_header_f64(headers: &HeaderMap, name: &str) -> Option<f64> {
-    parse_header_str(headers, name)?
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
+    let value = headers.get(name)?.to_str().ok()?.parse::<f64>().ok()?;
+    value.is_finite().then_some(value)
 }
 
 fn parse_header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
-    parse_header_str(headers, name)?.parse::<u64>().ok()
+    headers.get(name)?.to_str().ok()?.parse().ok()
 }
 
 fn parse_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -585,56 +566,35 @@ async fn process_sse<S>(
         };
 
         match event.kind.as_str() {
-            // Individual output item finalised. Forward immediately so the
-            // rest of the agent can stream assistant text/functions *live*
-            // instead of waiting for the final `response.completed` envelope.
-            //
-            // IMPORTANT: We used to ignore these events and forward the
-            // duplicated `output` array embedded in the `response.completed`
-            // payload.  That produced two concrete issues:
-            //   1. No real‑time streaming – the user only saw output after the
-            //      entire turn had finished, which broke the "typing" UX and
-            //      made long‑running turns look stalled.
-            //   2. Duplicate `function_call_output` items – both the
-            //      individual *and* the completed array were forwarded, which
-            //      confused the backend and triggered 400
-            //      "previous_response_not_found" errors because the duplicated
-            //      IDs did not match the incremental turn chain.
-            //
-            // The fix is to forward the incremental events *as they come* and
-            // drop the duplicated list inside `response.completed`.
             "response.output_item.done" => {
-                let Some(item_val) = event.item else { continue };
-                let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) else {
-                    debug!("failed to parse ResponseItem from output_item.done");
-                    continue;
-                };
-
-                let event = ResponseEvent::OutputItemDone(item);
-                if tx_event.send(Ok(event)).await.is_err() {
-                    return;
+                if let Some(item_val) = event.item {
+                    if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
+                        let event = ResponseEvent::OutputItemDone(item);
+                        if tx_event.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    } else {
+                        debug!("failed to parse ResponseItem from output_item.done");
+                    }
                 }
             }
             "response.output_text.delta" => {
                 if let Some(delta) = event.delta {
-                    let event = ResponseEvent::OutputTextDelta(delta);
-                    if tx_event.send(Ok(event)).await.is_err() {
+                    if tx_event.send(Ok(ResponseEvent::OutputTextDelta(delta))).await.is_err() {
                         return;
                     }
                 }
             }
             "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = event.delta {
-                    let event = ResponseEvent::ReasoningSummaryDelta(delta);
-                    if tx_event.send(Ok(event)).await.is_err() {
+                    if tx_event.send(Ok(ResponseEvent::ReasoningSummaryDelta(delta))).await.is_err() {
                         return;
                     }
                 }
             }
             "response.reasoning_text.delta" => {
                 if let Some(delta) = event.delta {
-                    let event = ResponseEvent::ReasoningContentDelta(delta);
-                    if tx_event.send(Ok(event)).await.is_err() {
+                    if tx_event.send(Ok(ResponseEvent::ReasoningContentDelta(delta))).await.is_err() {
                         return;
                     }
                 }
@@ -724,15 +684,10 @@ async fn stream_from_fixture(
     provider: ModelProviderInfo,
 ) -> Result<ResponseStream> {
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
-    let f = std::fs::File::open(path.as_ref())?;
-    let lines = std::io::BufReader::new(f).lines();
-
-    // insert \n\n after each line for proper SSE parsing
-    let mut content = String::new();
-    for line in lines {
-        content.push_str(&line?);
-        content.push_str("\n\n");
-    }
+    let content = std::fs::read_to_string(path.as_ref())?
+        .lines()
+        .map(|line| format!("{line}\n\n"))
+        .collect::<String>();
 
     let rdr = std::io::Cursor::new(content);
     let stream = ReaderStream::new(rdr).map_err(CodexErr::Io);

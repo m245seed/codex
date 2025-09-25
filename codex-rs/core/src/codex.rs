@@ -1,137 +1,53 @@
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::time::Duration;
+use std::{borrow::Cow, collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, atomic::AtomicU64}, time::Duration};
 
-use crate::AuthManager;
-use crate::client_common::REVIEW_PROMPT;
-use crate::event_mapping::map_response_item_to_event_messages;
-use crate::review_format::format_review_findings_block;
-use async_channel::Receiver;
-use async_channel::Sender;
-use codex_apply_patch::ApplyPatchAction;
-use codex_apply_patch::MaybeApplyPatchVerified;
-use codex_apply_patch::maybe_parse_apply_patch_verified;
-use codex_protocol::mcp_protocol::ConversationId;
-use codex_protocol::protocol::ConversationPathResponseEvent;
-use codex_protocol::protocol::ExitedReviewModeEvent;
-use codex_protocol::protocol::ReviewRequest;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::TaskStartedEvent;
-use codex_protocol::protocol::TurnAbortReason;
-use codex_protocol::protocol::TurnAbortedEvent;
-use codex_protocol::protocol::TurnContextItem;
+use async_channel::{Receiver, Sender};
 use futures::prelude::*;
 use mcp_types::CallToolResult;
-use serde::Deserialize;
-use serde::Serialize;
-use serde_json;
-use tokio::sync::Mutex;
-use tokio::sync::oneshot;
-use tokio::task::AbortHandle;
-use tracing::debug;
-use tracing::error;
-use tracing::info;
-use tracing::trace;
-use tracing::warn;
+use serde::{Deserialize, Serialize};
+use tokio::{sync::{Mutex, oneshot}, task::AbortHandle};
+use tracing::{debug, error, info, trace, warn};
 
-use crate::ModelProviderInfo;
-use crate::apply_patch;
-use crate::apply_patch::ApplyPatchExec;
-use crate::apply_patch::CODEX_APPLY_PATCH_ARG1;
-use crate::apply_patch::InternalApplyPatchInvocation;
-use crate::apply_patch::convert_apply_patch_to_protocol;
-use crate::client::ModelClient;
-use crate::client_common::Prompt;
-use crate::client_common::ResponseEvent;
-use crate::config::Config;
-use crate::config_types::ShellEnvironmentPolicy;
-use crate::conversation_history::ConversationHistory;
-use crate::environment_context::EnvironmentContext;
-use crate::error::CodexErr;
-use crate::error::Result as CodexResult;
-use crate::error::SandboxErr;
-use crate::error::get_error_message_ui;
-use crate::exec::ExecParams;
-use crate::exec::ExecToolCallOutput;
-use crate::exec::SandboxType;
-use crate::exec::StdoutStream;
-use crate::exec::StreamOutput;
-use crate::exec::process_exec_tool_call;
-use crate::exec_command::EXEC_COMMAND_TOOL_NAME;
-use crate::exec_command::ExecCommandParams;
-use crate::exec_command::ExecSessionManager;
-use crate::exec_command::WRITE_STDIN_TOOL_NAME;
-use crate::exec_command::WriteStdinParams;
-use crate::exec_env::create_env;
-use crate::mcp_connection_manager::McpConnectionManager;
-use crate::mcp_tool_call::handle_mcp_tool_call;
-use crate::model_family::find_family_for_model;
-use crate::openai_model_info::get_model_info;
-use crate::openai_tools::ApplyPatchToolArgs;
-use crate::openai_tools::ToolsConfig;
-use crate::openai_tools::ToolsConfigParams;
-use crate::openai_tools::get_openai_tools;
-use crate::parse_command::parse_command;
-use crate::plan_tool::handle_update_plan;
-use crate::project_doc::get_user_instructions;
-use crate::protocol::AgentMessageDeltaEvent;
-use crate::protocol::AgentReasoningDeltaEvent;
-use crate::protocol::AgentReasoningRawContentDeltaEvent;
-use crate::protocol::AgentReasoningSectionBreakEvent;
-use crate::protocol::ApplyPatchApprovalRequestEvent;
-use crate::protocol::AskForApproval;
-use crate::protocol::BackgroundEventEvent;
-use crate::protocol::ErrorEvent;
-use crate::protocol::Event;
-use crate::protocol::EventMsg;
-use crate::protocol::ExecApprovalRequestEvent;
-use crate::protocol::ExecCommandBeginEvent;
-use crate::protocol::ExecCommandEndEvent;
-use crate::protocol::FileChange;
-use crate::protocol::InputItem;
-use crate::protocol::ListCustomPromptsResponseEvent;
-use crate::protocol::Op;
-use crate::protocol::PatchApplyBeginEvent;
-use crate::protocol::PatchApplyEndEvent;
-use crate::protocol::RateLimitSnapshotEvent;
-use crate::protocol::ReviewDecision;
-use crate::protocol::ReviewOutputEvent;
-use crate::protocol::SandboxPolicy;
-use crate::protocol::SessionConfiguredEvent;
-use crate::protocol::StreamErrorEvent;
-use crate::protocol::Submission;
-use crate::protocol::TaskCompleteEvent;
-use crate::protocol::TokenCountEvent;
-use crate::protocol::TokenUsage;
-use crate::protocol::TokenUsageInfo;
-use crate::protocol::TurnDiffEvent;
-use crate::protocol::WebSearchBeginEvent;
-use crate::rollout::RolloutRecorder;
-use crate::rollout::RolloutRecorderParams;
-use crate::safety::SafetyCheck;
-use crate::safety::assess_command_safety;
-use crate::safety::assess_safety_for_untrusted_command;
-use crate::shell;
-use crate::turn_diff_tracker::TurnDiffTracker;
-use crate::unified_exec::UnifiedExecSessionManager;
-use crate::user_instructions::UserInstructions;
-use crate::user_notification::UserNotification;
-use crate::util::backoff;
-use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use codex_protocol::custom_prompts::CustomPrompt;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputPayload;
-use codex_protocol::models::LocalShellAction;
-use codex_protocol::models::ResponseInputItem;
-use codex_protocol::models::ResponseItem;
-use codex_protocol::models::ShellToolCallParams;
-use codex_protocol::protocol::InitialHistory;
+use codex_apply_patch::{ApplyPatchAction, MaybeApplyPatchVerified, maybe_parse_apply_patch_verified};
+use codex_protocol::{
+    config_types::{ReasoningEffort as ReasoningEffortConfig, ReasoningSummary as ReasoningSummaryConfig},
+    custom_prompts::CustomPrompt,
+    mcp_protocol::ConversationId,
+    models::{ContentItem, FunctionCallOutputPayload, LocalShellAction, ResponseInputItem, ResponseItem, ShellToolCallParams},
+    protocol::*,
+};
+
+use crate::{
+    AuthManager, ModelProviderInfo,
+    apply_patch::{self, ApplyPatchExec, CODEX_APPLY_PATCH_ARG1, InternalApplyPatchInvocation, convert_apply_patch_to_protocol},
+    client::ModelClient,
+    client_common::{Prompt, ResponseEvent, REVIEW_PROMPT},
+    config::Config,
+    config_types::ShellEnvironmentPolicy,
+    conversation_history::ConversationHistory,
+    environment_context::EnvironmentContext,
+    error::{CodexErr, Result as CodexResult, SandboxErr, get_error_message_ui},
+    event_mapping::map_response_item_to_event_messages,
+    exec::{ExecParams, ExecToolCallOutput, SandboxType, StdoutStream, StreamOutput, process_exec_tool_call},
+    exec_command::{EXEC_COMMAND_TOOL_NAME, ExecCommandParams, ExecSessionManager, WRITE_STDIN_TOOL_NAME, WriteStdinParams},
+    exec_env::create_env,
+    mcp_connection_manager::McpConnectionManager,
+    mcp_tool_call::handle_mcp_tool_call,
+    model_family::find_family_for_model,
+    openai_model_info::get_model_info,
+    openai_tools::{ApplyPatchToolArgs, ToolsConfig, ToolsConfigParams, get_openai_tools},
+    parse_command::parse_command,
+    plan_tool::handle_update_plan,
+    project_doc::get_user_instructions,
+    review_format::format_review_findings_block,
+    rollout::{RolloutRecorder, RolloutRecorderParams},
+    safety::{SafetyCheck, assess_command_safety, assess_safety_for_untrusted_command},
+    shell,
+    turn_diff_tracker::TurnDiffTracker,
+    unified_exec::UnifiedExecSessionManager,
+    user_instructions::UserInstructions,
+    user_notification::UserNotification,
+    util::backoff,
+};
 
 pub mod compact;
 use self::compact::build_compacted_history;
@@ -221,32 +137,19 @@ impl Codex {
 
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .to_string();
-        let sub = Submission { id: id.clone(), op };
-        self.submit_with_id(sub).await?;
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst).to_string();
+        self.submit_with_id(Submission { id: id.clone(), op }).await?;
         Ok(id)
     }
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
     /// unique IDs for each submission.
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
-        self.tx_sub
-            .send(sub)
-            .await
-            .map_err(|_| CodexErr::InternalAgentDied)?;
-        Ok(())
+        self.tx_sub.send(sub).await.map_err(|_| CodexErr::InternalAgentDied)
     }
 
     pub async fn next_event(&self) -> CodexResult<Event> {
-        let event = self
-            .rx_event
-            .recv()
-            .await
-            .map_err(|_| CodexErr::InternalAgentDied)?;
-        Ok(event)
+        self.rx_event.recv().await.map_err(|_| CodexErr::InternalAgentDied)
     }
 }
 
@@ -579,17 +482,10 @@ impl Session {
         }
     }
 
-    pub async fn request_command_approval(
-        &self,
-        sub_id: String,
-        call_id: String,
-        command: Vec<String>,
-        cwd: PathBuf,
-        reason: Option<String>,
-    ) -> oneshot::Receiver<ReviewDecision> {
-        // Add the tx_approve callback to the map before sending the request.
+    async fn request_approval(&self, sub_id: String, msg: EventMsg) -> oneshot::Receiver<ReviewDecision> {
         let (tx_approve, rx_approve) = oneshot::channel();
         let event_id = sub_id.clone();
+        
         let prev_entry = {
             let mut state = self.state.lock().await;
             state.pending_approvals.insert(sub_id, tx_approve)
@@ -598,17 +494,21 @@ impl Session {
             warn!("Overwriting existing pending approval for sub_id: {event_id}");
         }
 
-        let event = Event {
-            id: event_id,
-            msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
-                call_id,
-                command,
-                cwd,
-                reason,
-            }),
-        };
-        self.send_event(event).await;
+        self.send_event(Event { id: event_id, msg }).await;
         rx_approve
+    }
+
+    pub async fn request_command_approval(
+        &self,
+        sub_id: String,
+        call_id: String,
+        command: Vec<String>,
+        cwd: PathBuf,
+        reason: Option<String>,
+    ) -> oneshot::Receiver<ReviewDecision> {
+        self.request_approval(sub_id, EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+            call_id, command, cwd, reason
+        })).await
     }
 
     pub async fn request_patch_approval(
@@ -619,28 +519,12 @@ impl Session {
         reason: Option<String>,
         grant_root: Option<PathBuf>,
     ) -> oneshot::Receiver<ReviewDecision> {
-        // Add the tx_approve callback to the map before sending the request.
-        let (tx_approve, rx_approve) = oneshot::channel();
-        let event_id = sub_id.clone();
-        let prev_entry = {
-            let mut state = self.state.lock().await;
-            state.pending_approvals.insert(sub_id, tx_approve)
-        };
-        if prev_entry.is_some() {
-            warn!("Overwriting existing pending approval for sub_id: {event_id}");
-        }
-
-        let event = Event {
-            id: event_id,
-            msg: EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
-                call_id,
-                changes: convert_apply_patch_to_protocol(action),
-                reason,
-                grant_root,
-            }),
-        };
-        self.send_event(event).await;
-        rx_approve
+        self.request_approval(sub_id, EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
+            call_id,
+            changes: convert_apply_patch_to_protocol(action),
+            reason,
+            grant_root,
+        })).await
     }
 
     pub async fn notify_approval(&self, sub_id: &str, decision: ReviewDecision) {
@@ -951,24 +835,16 @@ impl Session {
     /// Helper that emits a BackgroundEvent with the given message. This keeps
     /// the call‑sites terse so adding more diagnostics does not clutter the
     /// core agent logic.
+    async fn notify_event(&self, sub_id: &str, msg: EventMsg) {
+        self.send_event(Event { id: sub_id.to_string(), msg }).await;
+    }
+
     async fn notify_background_event(&self, sub_id: &str, message: impl Into<String>) {
-        let event = Event {
-            id: sub_id.to_string(),
-            msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
-                message: message.into(),
-            }),
-        };
-        self.send_event(event).await;
+        self.notify_event(sub_id, EventMsg::BackgroundEvent(BackgroundEventEvent { message: message.into() })).await;
     }
 
     async fn notify_stream_error(&self, sub_id: &str, message: impl Into<String>) {
-        let event = Event {
-            id: sub_id.to_string(),
-            msg: EventMsg::StreamError(StreamErrorEvent {
-                message: message.into(),
-            }),
-        };
-        self.send_event(event).await;
+        self.notify_event(sub_id, EventMsg::StreamError(StreamErrorEvent { message: message.into() })).await;
     }
 
     /// Build the full turn input by concatenating the current conversation
@@ -1373,18 +1249,12 @@ async fn submission_loop(
                     sess.set_task(task).await;
                 }
             }
-            Op::ExecApproval { id, decision } => match decision {
-                ReviewDecision::Abort => {
-                    sess.interrupt_task().await;
+            Op::ExecApproval { id, decision } | Op::PatchApproval { id, decision } => {
+                match decision {
+                    ReviewDecision::Abort => sess.interrupt_task().await,
+                    other => sess.notify_approval(&id, other).await,
                 }
-                other => sess.notify_approval(&id, other).await,
-            },
-            Op::PatchApproval { id, decision } => match decision {
-                ReviewDecision::Abort => {
-                    sess.interrupt_task().await;
-                }
-                other => sess.notify_approval(&id, other).await,
-            },
+            }
             Op::AddToHistory { text } => {
                 let id = sess.conversation_id;
                 let config = config.clone();
@@ -2316,12 +2186,8 @@ async fn handle_response_item(
             )
             .await,
         ),
-        ResponseItem::FunctionCallOutput { .. } => {
-            debug!("unexpected FunctionCallOutput from stream");
-            None
-        }
-        ResponseItem::CustomToolCallOutput { .. } => {
-            debug!("unexpected CustomToolCallOutput from stream");
+        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
+            debug!("unexpected output from stream");
             None
         }
         ResponseItem::Message { .. }

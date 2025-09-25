@@ -38,37 +38,31 @@ impl EnvironmentContext {
         sandbox_policy: Option<SandboxPolicy>,
         shell: Option<Shell>,
     ) -> Self {
+        let (sandbox_mode, network_access, writable_roots) = match sandbox_policy {
+            Some(SandboxPolicy::DangerFullAccess) => (
+                Some(SandboxMode::DangerFullAccess),
+                Some(NetworkAccess::Enabled),
+                None,
+            ),
+            Some(SandboxPolicy::ReadOnly) => (
+                Some(SandboxMode::ReadOnly),
+                Some(NetworkAccess::Restricted),
+                None,
+            ),
+            Some(SandboxPolicy::WorkspaceWrite { network_access, writable_roots, .. }) => (
+                Some(SandboxMode::WorkspaceWrite),
+                Some(if network_access { NetworkAccess::Enabled } else { NetworkAccess::Restricted }),
+                (!writable_roots.is_empty()).then_some(writable_roots),
+            ),
+            None => (None, None, None),
+        };
+
         Self {
             cwd,
             approval_policy,
-            sandbox_mode: match sandbox_policy {
-                Some(SandboxPolicy::DangerFullAccess) => Some(SandboxMode::DangerFullAccess),
-                Some(SandboxPolicy::ReadOnly) => Some(SandboxMode::ReadOnly),
-                Some(SandboxPolicy::WorkspaceWrite { .. }) => Some(SandboxMode::WorkspaceWrite),
-                None => None,
-            },
-            network_access: match sandbox_policy {
-                Some(SandboxPolicy::DangerFullAccess) => Some(NetworkAccess::Enabled),
-                Some(SandboxPolicy::ReadOnly) => Some(NetworkAccess::Restricted),
-                Some(SandboxPolicy::WorkspaceWrite { network_access, .. }) => {
-                    if network_access {
-                        Some(NetworkAccess::Enabled)
-                    } else {
-                        Some(NetworkAccess::Restricted)
-                    }
-                }
-                None => None,
-            },
-            writable_roots: match sandbox_policy {
-                Some(SandboxPolicy::WorkspaceWrite { writable_roots, .. }) => {
-                    if writable_roots.is_empty() {
-                        None
-                    } else {
-                        Some(writable_roots)
-                    }
-                }
-                _ => None,
-            },
+            sandbox_mode,
+            network_access,
+            writable_roots,
             shell,
         }
     }
@@ -77,21 +71,8 @@ impl EnvironmentContext {
     /// comparing turn to turn, since the initial environment_context will
     /// include the shell, and then it is not configurable from turn to turn.
     pub fn equals_except_shell(&self, other: &EnvironmentContext) -> bool {
-        let EnvironmentContext {
-            cwd,
-            approval_policy,
-            sandbox_mode,
-            network_access,
-            writable_roots,
-            // should compare all fields except shell
-            shell: _,
-        } = other;
-
-        self.cwd == *cwd
-            && self.approval_policy == *approval_policy
-            && self.sandbox_mode == *sandbox_mode
-            && self.network_access == *network_access
-            && self.writable_roots == *writable_roots
+        (self.cwd, &self.approval_policy, &self.sandbox_mode, &self.network_access, &self.writable_roots)
+            == (other.cwd.as_ref(), &other.approval_policy, &other.sandbox_mode, &other.network_access, &other.writable_roots)
     }
 }
 
@@ -123,40 +104,38 @@ impl EnvironmentContext {
     /// </environment_context>
     /// ```
     pub fn serialize_to_xml(self) -> String {
-        let mut lines = vec![ENVIRONMENT_CONTEXT_OPEN_TAG.to_string()];
+        use std::fmt::Write;
+        
+        let mut result = String::with_capacity(512);
+        result.push_str(ENVIRONMENT_CONTEXT_OPEN_TAG);
+        result.push('\n');
+        
         if let Some(cwd) = self.cwd {
-            lines.push(format!("  <cwd>{}</cwd>", cwd.to_string_lossy()));
+            write!(&mut result, "  <cwd>{}</cwd>\n", cwd.to_string_lossy()).unwrap();
         }
         if let Some(approval_policy) = self.approval_policy {
-            lines.push(format!(
-                "  <approval_policy>{approval_policy}</approval_policy>"
-            ));
+            write!(&mut result, "  <approval_policy>{approval_policy}</approval_policy>\n").unwrap();
         }
         if let Some(sandbox_mode) = self.sandbox_mode {
-            lines.push(format!("  <sandbox_mode>{sandbox_mode}</sandbox_mode>"));
+            write!(&mut result, "  <sandbox_mode>{sandbox_mode}</sandbox_mode>\n").unwrap();
         }
         if let Some(network_access) = self.network_access {
-            lines.push(format!(
-                "  <network_access>{network_access}</network_access>"
-            ));
+            write!(&mut result, "  <network_access>{network_access}</network_access>\n").unwrap();
         }
         if let Some(writable_roots) = self.writable_roots {
-            lines.push("  <writable_roots>".to_string());
+            result.push_str("  <writable_roots>\n");
             for writable_root in writable_roots {
-                lines.push(format!(
-                    "    <root>{}</root>",
-                    writable_root.to_string_lossy()
-                ));
+                write!(&mut result, "    <root>{}</root>\n", writable_root.to_string_lossy()).unwrap();
             }
-            lines.push("  </writable_roots>".to_string());
+            result.push_str("  </writable_roots>\n");
         }
         if let Some(shell) = self.shell
             && let Some(shell_name) = shell.name()
         {
-            lines.push(format!("  <shell>{shell_name}</shell>"));
+            write!(&mut result, "  <shell>{shell_name}</shell>\n").unwrap();
         }
-        lines.push(ENVIRONMENT_CONTEXT_CLOSE_TAG.to_string());
-        lines.join("\n")
+        result.push_str(ENVIRONMENT_CONTEXT_CLOSE_TAG);
+        result
     }
 }
 

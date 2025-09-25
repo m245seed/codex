@@ -1,16 +1,20 @@
-use tree_sitter::Parser;
-use tree_sitter::Tree;
+use tree_sitter::{Parser, Tree};
 use tree_sitter_bash::LANGUAGE as BASH;
+
+thread_local! {
+    static PARSER: std::cell::RefCell<Parser> = std::cell::RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&BASH.into()).expect("load bash grammar");
+        p
+    });
+}
 
 /// Parse the provided bash source using tree-sitter-bash, returning a Tree on
 /// success or None if parsing failed.
 pub fn try_parse_bash(bash_lc_arg: &str) -> Option<Tree> {
-    let lang = BASH.into();
-    let mut parser = Parser::new();
-    #[expect(clippy::expect_used)]
-    parser.set_language(&lang).expect("load bash grammar");
-    let old_tree: Option<&Tree> = None;
-    parser.parse(bash_lc_arg, old_tree)
+    PARSER.with(|parser| {
+        parser.borrow_mut().parse(bash_lc_arg, None)
+    })
 }
 
 /// Parse a script which may contain multiple simple commands joined only by
@@ -25,110 +29,74 @@ pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<V
         return None;
     }
 
-    // List of allowed (named) node kinds for a "word only commands sequence".
-    // If we encounter a named node that is not in this list we reject.
-    const ALLOWED_KINDS: &[&str] = &[
-        // top level containers
-        "program",
-        "list",
-        "pipeline",
-        // commands & words
-        "command",
-        "command_name",
-        "word",
-        "string",
-        "string_content",
-        "raw_string",
-        "number",
-    ];
-    // Allow only safe punctuation / operator tokens; anything else causes reject.
-    const ALLOWED_PUNCT_TOKENS: &[&str] = &["&&", "||", ";", "|", "\"", "'"];
-
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    let mut stack = vec![root];
-    let mut command_nodes = Vec::new();
-    while let Some(node) = stack.pop() {
-        let kind = node.kind();
-        if node.is_named() {
-            if !ALLOWED_KINDS.contains(&kind) {
-                return None;
-            }
-            if kind == "command" {
-                command_nodes.push(node);
-            }
-        } else {
-            // Reject any punctuation / operator tokens that are not explicitly allowed.
-            if kind.chars().any(|c| "&;|".contains(c)) && !ALLOWED_PUNCT_TOKENS.contains(&kind) {
-                return None;
-            }
-            if !(ALLOWED_PUNCT_TOKENS.contains(&kind) || kind.trim().is_empty()) {
-                // If it's a quote token or operator it's allowed above; we also allow whitespace tokens.
-                // Any other punctuation like parentheses, braces, redirects, backticks, etc are rejected.
-                return None;
-            }
-        }
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-
-    // Walk uses a stack (LIFO), so re-sort by position to restore source order.
-    command_nodes.sort_by_key(|node| node.start_byte());
-
     let mut commands = Vec::new();
-    for node in command_nodes {
-        if let Some(words) = parse_plain_command_from_node(node, src) {
-            commands.push(words);
-        } else {
-            return None;
+    let mut cursor = tree.walk();
+    
+    fn visit_node(node: tree_sitter::Node, src: &str, commands: &mut Vec<Vec<String>>, cursor: &mut tree_sitter::TreeCursor) -> bool {
+        match node.kind() {
+            "command" => {
+                if let Some(words) = parse_plain_command_from_node(node, src) {
+                    commands.push(words);
+                } else {
+                    return false;
+                }
+            }
+            // Allowed containers
+            "program" | "list" | "pipeline" => {
+                for child in node.children(cursor) {
+                    if !visit_node(child, src, commands, cursor) {
+                        return false;
+                    }
+                }
+            }
+            // Allowed tokens
+            "&&" | "||" | ";" | "|" | "\"" | "'" => {}
+            // Whitespace
+            kind if kind.trim().is_empty() => {}
+            // Reject everything else
+            _ => return false,
         }
+        true
     }
-    Some(commands)
+    
+    if visit_node(tree.root_node(), src, &mut commands, &mut cursor) {
+        Some(commands)
+    } else {
+        None
+    }
 }
 
 fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Vec<String>> {
     if cmd.kind() != "command" {
         return None;
     }
+    
+    let src_bytes = src.as_bytes();
     let mut words = Vec::new();
     let mut cursor = cmd.walk();
+    
     for child in cmd.named_children(&mut cursor) {
-        match child.kind() {
+        let text = match child.kind() {
             "command_name" => {
                 let word_node = child.named_child(0)?;
-                if word_node.kind() != "word" {
-                    return None;
-                }
-                words.push(word_node.utf8_text(src.as_bytes()).ok()?.to_owned());
+                if word_node.kind() != "word" { return None; }
+                word_node.utf8_text(src_bytes).ok()?
             }
-            "word" | "number" => {
-                words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
-            }
+            "word" | "number" => child.utf8_text(src_bytes).ok()?,
             "string" => {
-                if child.child_count() == 3
-                    && child.child(0)?.kind() == "\""
-                    && child.child(1)?.kind() == "string_content"
-                    && child.child(2)?.kind() == "\""
-                {
-                    words.push(child.child(1)?.utf8_text(src.as_bytes()).ok()?.to_owned());
+                if child.child_count() == 3 {
+                    child.child(1)?.utf8_text(src_bytes).ok()?
                 } else {
                     return None;
                 }
             }
             "raw_string" => {
-                let raw_string = child.utf8_text(src.as_bytes()).ok()?;
-                let stripped = raw_string
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''));
-                if let Some(s) = stripped {
-                    words.push(s.to_owned());
-                } else {
-                    return None;
-                }
+                let raw = child.utf8_text(src_bytes).ok()?;
+                raw.strip_prefix('\'')?.strip_suffix('\'')?  
             }
             _ => return None,
-        }
+        };
+        words.push(text.to_owned());
     }
     Some(words)
 }

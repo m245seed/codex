@@ -1,25 +1,19 @@
-use chrono::DateTime;
-use chrono::Utc;
-use serde::Deserialize;
-use serde::Serialize;
-use std::env;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::io::Write;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::{
+    env,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::Duration;
 
 use codex_protocol::mcp_protocol::AuthMode;
 
-use crate::token_data::PlanType;
-use crate::token_data::TokenData;
-use crate::token_data::parse_id_token;
+use crate::token_data::{PlanType, TokenData, parse_id_token};
 
 #[derive(Debug, Clone)]
 pub struct CodexAuth {
@@ -192,8 +186,10 @@ pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
 pub fn read_openai_api_key_from_env() -> Option<String> {
     env::var(OPENAI_API_KEY_ENV_VAR)
         .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        })
 }
 
 pub fn get_auth_file(codex_home: &Path) -> PathBuf {
@@ -366,7 +362,7 @@ pub struct AuthDotJson {
 // Shared constant for token refresh (client id used for oauth token refresh flow)
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
-use std::sync::RwLock;
+
 
 /// Internal cached auth state.
 #[derive(Clone, Debug)]

@@ -16,29 +16,23 @@
 
 #[cfg(unix)]
 use std::collections::HashMap;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Result;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Result, Write, BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
-
-use serde::Deserialize;
-use serde::Serialize;
-#[cfg(unix)]
-use std::sync::OnceLock;
-
 use std::time::Duration;
-use tokio::fs;
-use tokio::io::AsyncReadExt;
+
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::sync::{OnceLock, Mutex};
+
+use tokio::{fs, io::AsyncReadExt};
 
 use crate::config::Config;
 use crate::config_types::HistoryPersistence;
-
 use codex_protocol::mcp_protocol::ConversationId;
+
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, MetadataExt};
 
 /// Filename that stores the message history inside `~/.codex`.
 const HISTORY_FILENAME: &str = "history.jsonl";
@@ -136,16 +130,10 @@ impl HistoryCache {
 
     fn read_more(&mut self, log_id: u64, target: usize) -> CacheResult<ReadOutcome> {
         use std::fs::TryLockError;
-        use std::io::BufRead;
-        use std::io::BufReader;
-        use std::io::Seek;
-        use std::io::SeekFrom;
-        use std::os::unix::fs::MetadataExt;
 
         let mut file = OpenOptions::new().read(true).open(&self.path)?;
 
-        let metadata = file.metadata()?;
-        if metadata.ino() != log_id {
+        if file.metadata()?.ino() != log_id {
             return Err(CacheAccessError::LogIdMismatch);
         }
 
@@ -155,33 +143,27 @@ impl HistoryCache {
                     file.seek(SeekFrom::Start(self.byte_offset))?;
                     let mut reader = BufReader::new(&file);
                     let mut read_bytes = 0u64;
+                    let mut line = String::new();
                     let mut appended = false;
 
-                    loop {
-                        let mut line = String::new();
-                        let bytes_read = reader.read_line(&mut line)?;
-                        if bytes_read == 0 {
-                            break;
-                        }
-                        read_bytes += bytes_read as u64;
+                    while reader.read_line(&mut line)? > 0 {
+                        read_bytes += line.len() as u64;
+                        
                         let trimmed = line.trim_end_matches(['\n', '\r']);
-                        if trimmed.is_empty() {
-                            continue;
+                        if !trimmed.is_empty() {
+                            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(trimmed) {
+                                self.entries.push(entry);
+                                appended = true;
+                                if self.entries.len() > target {
+                                    break;
+                                }
+                            }
                         }
-                        let entry: HistoryEntry = serde_json::from_str(trimmed)?;
-                        self.entries.push(entry);
-                        appended = true;
-                        if self.entries.len() > target {
-                            break;
-                        }
+                        line.clear();
                     }
 
                     self.byte_offset += read_bytes;
-                    return Ok(if appended {
-                        ReadOutcome::Advanced
-                    } else {
-                        ReadOutcome::Eof
-                    });
+                    return Ok(if appended { ReadOutcome::Advanced } else { ReadOutcome::Eof });
                 }
                 Err(TryLockError::WouldBlock) => std::thread::sleep(RETRY_SLEEP),
                 Err(e) => return Err(CacheAccessError::Io(e.into())),
@@ -239,9 +221,11 @@ pub(crate) async fn append_entry(
         ts,
         text: text.to_string(),
     };
-    let mut line = serde_json::to_string(&entry)
-        .map_err(|e| std::io::Error::other(format!("failed to serialise history entry: {e}")))?;
-    line.push('\n');
+    let line = format!(
+        "{}\n",
+        serde_json::to_string(&entry)
+            .map_err(|e| std::io::Error::other(format!("failed to serialise history entry: {e}")))?;
+    );
 
     // Open in append-only mode.
     let mut options = OpenOptions::new();
@@ -309,15 +293,15 @@ pub(crate) async fn history_metadata(config: &Config) -> (u64, usize) {
         Err(_) => return (log_id, 0),
     };
 
-    // Count newline bytes.
-    let mut buf = [0u8; 8192];
+    // Count newline bytes with larger buffer for better performance.
+    const BUF_SIZE: usize = 64 * 1024;
+    let mut buf = vec![0u8; BUF_SIZE];
     let mut count = 0usize;
+    
     loop {
         match file.read(&mut buf).await {
             Ok(0) => break,
-            Ok(n) => {
-                count += buf[..n].iter().filter(|&&b| b == b'\n').count();
-            }
+            Ok(n) => count += buf[..n].iter().filter(|&&b| b == b'\n').count(),
             Err(_) => return (log_id, 0),
         }
     }
@@ -377,29 +361,9 @@ pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<Hist
     result
 }
 
-#[cfg(unix)]
-pub(crate) fn get_history_entry(
-    log_id: u64,
-    offset: usize,
-    config: &Config,
-) -> Option<HistoryEntry> {
-    lookup(log_id, offset, config)
-}
-
 /// Fallback stub for non-Unix systems: currently always returns `None`.
 #[cfg(not(unix))]
-pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<HistoryEntry> {
-    let _ = (log_id, offset, config);
-    None
-}
-
-#[cfg(not(unix))]
-pub(crate) fn get_history_entry(
-    log_id: u64,
-    offset: usize,
-    config: &Config,
-) -> Option<HistoryEntry> {
-    let _ = (log_id, offset, config);
+pub(crate) fn lookup(_log_id: u64, _offset: usize, _config: &Config) -> Option<HistoryEntry> {
     None
 }
 
@@ -481,7 +445,7 @@ mod tests {
         clear_cache();
 
         let first =
-            super::get_history_entry(log_id, 0, &config).unwrap_or_else(|| panic!("first entry"));
+            super::lookup(log_id, 0, &config).unwrap_or_else(|| panic!("first entry"));
         assert_eq!(first.text, "first");
 
         let (count_after_first, bytes_after_first) =
@@ -490,7 +454,7 @@ mod tests {
         assert!(bytes_after_first > 0);
 
         let second =
-            super::get_history_entry(log_id, 1, &config).unwrap_or_else(|| panic!("second entry"));
+            super::lookup(log_id, 1, &config).unwrap_or_else(|| panic!("second entry"));
         assert_eq!(second.text, "second");
 
         let (count_after_second, bytes_after_second) =
@@ -499,7 +463,7 @@ mod tests {
         assert!(bytes_after_second > bytes_after_first);
 
         let third =
-            super::get_history_entry(log_id, 2, &config).unwrap_or_else(|| panic!("third entry"));
+            super::lookup(log_id, 2, &config).unwrap_or_else(|| panic!("third entry"));
         assert_eq!(third.text, "third");
 
         let (count_after_third, bytes_after_third) =
@@ -544,11 +508,11 @@ mod tests {
         clear_cache();
 
         assert_eq!(
-            super::get_history_entry(log_id, 0, &config).map(|entry| entry.text),
+            super::lookup(log_id, 0, &config).map(|entry| entry.text),
             Some("first".to_string())
         );
         assert_eq!(
-            super::get_history_entry(log_id, 1, &config).map(|entry| entry.text),
+            super::lookup(log_id, 1, &config).map(|entry| entry.text),
             Some("second".to_string())
         );
 
@@ -570,7 +534,7 @@ mod tests {
         }
 
         let third =
-            super::get_history_entry(log_id, 2, &config).unwrap_or_else(|| panic!("third entry"));
+            super::lookup(log_id, 2, &config).unwrap_or_else(|| panic!("third entry"));
         assert_eq!(third.text, "third");
 
         let (count_after_append, bytes_after_append) =

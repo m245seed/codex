@@ -1,9 +1,6 @@
-use serde::Deserialize;
-use serde::Serialize;
-use serde_json::Value as JsonValue;
-use serde_json::json;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value as JsonValue};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::model_family::ModelFamily;
 use crate::plan_tool::PLAN_TOOL;
@@ -99,17 +96,8 @@ impl ToolsConfig {
             ConfigShellToolType::Default
         };
 
-        let apply_patch_tool_type = match model_family.apply_patch_tool_type {
-            Some(ApplyPatchToolType::Freeform) => Some(ApplyPatchToolType::Freeform),
-            Some(ApplyPatchToolType::Function) => Some(ApplyPatchToolType::Function),
-            None => {
-                if *include_apply_patch_tool {
-                    Some(ApplyPatchToolType::Freeform)
-                } else {
-                    None
-                }
-            }
-        };
+        let apply_patch_tool_type = model_family.apply_patch_tool_type
+            .or_else(|| include_apply_patch_tool.then_some(ApplyPatchToolType::Freeform));
 
         Self {
             shell_type,
@@ -159,38 +147,27 @@ pub(crate) enum JsonSchema {
 }
 
 fn create_unified_exec_tool() -> OpenAiTool {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "input".to_string(),
-        JsonSchema::Array {
+    let properties = BTreeMap::from([
+        ("input".to_string(), JsonSchema::Array {
             items: Box::new(JsonSchema::String { description: None }),
             description: Some(
                 "When no session_id is provided, treat the array as the command and arguments \
                  to launch. When session_id is set, concatenate the strings (in order) and write \
-                 them to the session's stdin."
-                    .to_string(),
+                 them to the session's stdin.".to_string(),
             ),
-        },
-    );
-    properties.insert(
-        "session_id".to_string(),
-        JsonSchema::String {
+        }),
+        ("session_id".to_string(), JsonSchema::String {
             description: Some(
                 "Identifier for an existing interactive session. If omitted, a new command \
-                 is spawned."
-                    .to_string(),
+                 is spawned.".to_string(),
             ),
-        },
-    );
-    properties.insert(
-        "timeout_ms".to_string(),
-        JsonSchema::Number {
+        }),
+        ("timeout_ms".to_string(), JsonSchema::Number {
             description: Some(
-                "Maximum time in milliseconds to wait for output after writing the input."
-                    .to_string(),
+                "Maximum time in milliseconds to wait for output after writing the input.".to_string(),
             ),
-        },
-    );
+        }),
+    ]);
 
     OpenAiTool::Function(ResponsesApiTool {
         name: "unified_exec".to_string(),
@@ -206,39 +183,24 @@ fn create_unified_exec_tool() -> OpenAiTool {
 }
 
 fn create_shell_tool() -> OpenAiTool {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "command".to_string(),
-        JsonSchema::Array {
+    let properties = BTreeMap::from([
+        ("command".to_string(), JsonSchema::Array {
             items: Box::new(JsonSchema::String { description: None }),
             description: Some("The command to execute".to_string()),
-        },
-    );
-    properties.insert(
-        "workdir".to_string(),
-        JsonSchema::String {
+        }),
+        ("workdir".to_string(), JsonSchema::String {
             description: Some("The working directory to execute the command in".to_string()),
-        },
-    );
-    properties.insert(
-        "timeout_ms".to_string(),
-        JsonSchema::Number {
+        }),
+        ("timeout_ms".to_string(), JsonSchema::Number {
             description: Some("The timeout for the command in milliseconds".to_string()),
-        },
-    );
-
-    properties.insert(
-        "with_escalated_permissions".to_string(),
-        JsonSchema::Boolean {
+        }),
+        ("with_escalated_permissions".to_string(), JsonSchema::Boolean {
             description: Some("Whether to request escalated permissions. Set to true if command needs to be run without sandbox restrictions".to_string()),
-        },
-    );
-    properties.insert(
-        "justification".to_string(),
-        JsonSchema::String {
+        }),
+        ("justification".to_string(), JsonSchema::String {
             description: Some("Only set if with_escalated_permissions is true. 1-sentence explanation of why we want to run this command.".to_string()),
-        },
-    );
+        }),
+    ]);
 
     OpenAiTool::Function(ResponsesApiTool {
         name: "shell".to_string(),
@@ -253,14 +215,11 @@ fn create_shell_tool() -> OpenAiTool {
 }
 
 fn create_view_image_tool() -> OpenAiTool {
-    // Support only local filesystem path.
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "path".to_string(),
-        JsonSchema::String {
+    let properties = BTreeMap::from([
+        ("path".to_string(), JsonSchema::String {
             description: Some("Local filesystem path to an image file".to_string()),
-        },
-    );
+        }),
+    ]);
 
     OpenAiTool::Function(ResponsesApiTool {
         name: "view_image".to_string(),
@@ -287,14 +246,9 @@ pub(crate) struct ApplyPatchToolArgs {
 pub fn create_tools_json_for_responses_api(
     tools: &[OpenAiTool],
 ) -> crate::error::Result<Vec<serde_json::Value>> {
-    let mut tools_json = Vec::new();
-
-    for tool in tools {
-        let json = serde_json::to_value(tool)?;
-        tools_json.push(json);
-    }
-
-    Ok(tools_json)
+    tools.iter()
+        .map(serde_json::to_value)
+        .collect()
 }
 /// Returns JSON values that are compatible with Function Calling in the
 /// Chat Completions API:
@@ -302,28 +256,19 @@ pub fn create_tools_json_for_responses_api(
 pub(crate) fn create_tools_json_for_chat_completions_api(
     tools: &[OpenAiTool],
 ) -> crate::error::Result<Vec<serde_json::Value>> {
-    // We start with the JSON for the Responses API and than rewrite it to match
-    // the chat completions tool call format.
-    let responses_api_tools_json = create_tools_json_for_responses_api(tools)?;
-    let tools_json = responses_api_tools_json
-        .into_iter()
-        .filter_map(|mut tool| {
-            if tool.get("type") != Some(&serde_json::Value::String("function".to_string())) {
-                return None;
-            }
-
-            if let Some(map) = tool.as_object_mut() {
-                // Remove "type" field as it is not needed in chat completions.
-                map.remove("type");
+    let tools_json = tools
+        .iter()
+        .filter_map(|tool| {
+            if let OpenAiTool::Function(func_tool) = tool {
                 Some(json!({
                     "type": "function",
-                    "function": map,
+                    "function": func_tool,
                 }))
             } else {
                 None
             }
         })
-        .collect::<Vec<serde_json::Value>>();
+        .collect();
     Ok(tools_json)
 }
 
@@ -483,7 +428,8 @@ pub(crate) fn get_openai_tools(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, mcp_types::Tool>>,
 ) -> Vec<OpenAiTool> {
-    let mut tools: Vec<OpenAiTool> = Vec::new();
+    let capacity = 8 + mcp_tools.as_ref().map_or(0, |m| m.len());
+    let mut tools = Vec::with_capacity(capacity);
 
     if config.experimental_unified_exec_tool {
         tools.push(create_unified_exec_tool());
@@ -530,18 +476,18 @@ pub(crate) fn get_openai_tools(
         tools.push(create_view_image_tool());
     }
     if let Some(mcp_tools) = mcp_tools {
-        // Ensure deterministic ordering to maximize prompt cache hits.
-        let mut entries: Vec<(String, mcp_types::Tool)> = mcp_tools.into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut entries: Vec<_> = mcp_tools.into_iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        for (name, tool) in entries.into_iter() {
-            match mcp_tool_to_openai_tool(name.clone(), tool.clone()) {
-                Ok(converted_tool) => tools.push(OpenAiTool::Function(converted_tool)),
+        tools.extend(entries.into_iter().filter_map(|(name, tool)| {
+            match mcp_tool_to_openai_tool(name.clone(), tool) {
+                Ok(converted_tool) => Some(OpenAiTool::Function(converted_tool)),
                 Err(e) => {
                     tracing::error!("Failed to convert {name:?} MCP tool to OpenAI tool: {e:?}");
+                    None
                 }
             }
-        }
+        }));
     }
 
     tools

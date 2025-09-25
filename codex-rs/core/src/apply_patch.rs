@@ -59,13 +59,6 @@ pub(crate) async fn apply_patch(
             })
         }
         SafetyCheck::AskUser => {
-            // Compute a readable summary of path changes to include in the
-            // approval request so the user can make an informed decision.
-            //
-            // Note that it might be worth expanding this approval request to
-            // give the user the option to expand the set of writable roots so
-            // that similar patches can be auto-approved in the future during
-            // this session.
             let rx_approve = sess
                 .request_patch_approval(sub_id.to_owned(), call_id.to_owned(), &action, None, None)
                 .await;
@@ -77,34 +70,31 @@ pub(crate) async fn apply_patch(
                     })
                 }
                 ReviewDecision::Denied | ReviewDecision::Abort => {
-                    ResponseInputItem::FunctionCallOutput {
-                        call_id: call_id.to_owned(),
-                        output: FunctionCallOutputPayload {
-                            content: "patch rejected by user".to_string(),
-                            success: Some(false),
-                        },
-                    }
-                    .into()
+                    create_rejection_response(call_id, "patch rejected by user")
                 }
             }
         }
-        SafetyCheck::Reject { reason } => ResponseInputItem::FunctionCallOutput {
-            call_id: call_id.to_owned(),
-            output: FunctionCallOutputPayload {
-                content: format!("patch rejected: {reason}"),
-                success: Some(false),
-            },
+        SafetyCheck::Reject { reason } => {
+            create_rejection_response(call_id, &format!("patch rejected: {reason}"))
         }
-        .into(),
     }
+}
+
+fn create_rejection_response(call_id: &str, content: &str) -> InternalApplyPatchInvocation {
+    ResponseInputItem::FunctionCallOutput {
+        call_id: call_id.to_owned(),
+        output: FunctionCallOutputPayload {
+            content: content.to_string(),
+            success: Some(false),
+        },
+    }
+    .into()
 }
 
 pub(crate) fn convert_apply_patch_to_protocol(
     action: &ApplyPatchAction,
 ) -> HashMap<PathBuf, FileChange> {
-    let changes = action.changes();
-    let mut result = HashMap::with_capacity(changes.len());
-    for (path, change) in changes {
+    action.changes().iter().map(|(path, change)| {
         let protocol_change = match change {
             ApplyPatchFileChange::Add { content } => FileChange::Add {
                 content: content.clone(),
@@ -115,13 +105,12 @@ pub(crate) fn convert_apply_patch_to_protocol(
             ApplyPatchFileChange::Update {
                 unified_diff,
                 move_path,
-                new_content: _new_content,
+                new_content: _,
             } => FileChange::Update {
                 unified_diff: unified_diff.clone(),
                 move_path: move_path.clone(),
             },
         };
-        result.insert(path.clone(), protocol_change);
-    }
-    result
+        (path.clone(), protocol_change)
+    }).collect()
 }

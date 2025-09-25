@@ -1,12 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::Context;
-use anyhow::Result;
-use anyhow::anyhow;
+use anyhow::{Context, Result, anyhow};
 use sha1::digest::Output;
 use uuid::Uuid;
 
@@ -52,82 +49,61 @@ impl TurnDiffTracker {
     /// - For additions, we intentionally do not create a baseline snapshot so that diffs are proper additions.
     /// - Also updates internal mappings for move/rename events.
     pub fn on_patch_begin(&mut self, changes: &HashMap<PathBuf, FileChange>) {
-        for (path, change) in changes.iter() {
+        for (path, change) in changes {
             // Ensure a stable internal filename exists for this external path.
-            if !self.external_to_temp_name.contains_key(path) {
-                let internal = Uuid::new_v4().to_string();
-                self.external_to_temp_name
-                    .insert(path.clone(), internal.clone());
-                self.temp_name_to_current_path
-                    .insert(internal.clone(), path.clone());
+            let internal = match self.external_to_temp_name.get(path) {
+                Some(existing) => existing.clone(),
+                None => {
+                    let internal = Uuid::new_v4().to_string();
+                    self.external_to_temp_name.insert(path.clone(), internal.clone());
+                    self.temp_name_to_current_path.insert(internal.clone(), path.clone());
 
-                // If the file exists on disk now, snapshot as baseline; else leave missing to represent /dev/null.
-                let baseline_file_info = if path.exists() {
-                    let mode = file_mode_for_path(path);
-                    let mode_val = mode.unwrap_or(FileMode::Regular);
-                    let content = blob_bytes(path, &mode_val).unwrap_or_default();
-                    // Compute blob id directly from in-memory bytes. For symlinks this already
-                    // represents the target path bytes; for regular/executable files it is the
-                    // file contents. This matches `git hash-object` output. Avoid spawning an
-                    // external `git` process for performance. (If reading failed we already have
-                    // empty content and produce the ZERO_OID later when comparing.)
-                    let oid = if mode == Some(FileMode::Symlink) {
-                        format!("{:x}", git_blob_sha1_hex_bytes(&content))
+                    // Create baseline snapshot
+                    let baseline_info = if path.exists() {
+                        let mode = file_mode_for_path(path).unwrap_or(FileMode::Regular);
+                        let content = blob_bytes(path, &mode).unwrap_or_default();
+                        let oid = format!("{:x}", git_blob_sha1_hex_bytes(&content));
+                        BaselineFileInfo {
+                            path: path.clone(),
+                            content,
+                            mode,
+                            oid,
+                        }
                     } else {
-                        format!("{:x}", git_blob_sha1_hex_bytes(&content))
+                        BaselineFileInfo {
+                            path: path.clone(),
+                            content: Vec::new(),
+                            mode: FileMode::Regular,
+                            oid: ZERO_OID.to_string(),
+                        }
                     };
-                    Some(BaselineFileInfo {
-                        path: path.clone(),
-                        content,
-                        mode: mode_val,
-                        oid,
-                    })
-                } else {
-                    Some(BaselineFileInfo {
-                        path: path.clone(),
-                        content: vec![],
-                        mode: FileMode::Regular,
-                        oid: ZERO_OID.to_string(),
-                    })
-                };
-
-                if let Some(baseline_file_info) = baseline_file_info {
-                    self.baseline_file_info
-                        .insert(internal.clone(), baseline_file_info);
+                    self.baseline_file_info.insert(internal.clone(), baseline_info);
+                    internal
                 }
-            }
+            };
 
-            // Track rename/move in current mapping if provided in an Update.
-            if let FileChange::Update {
-                move_path: Some(dest),
-                ..
-            } = change
-            {
-                let uuid_filename = match self.external_to_temp_name.get(path) {
-                    Some(i) => i.clone(),
-                    None => {
-                        // This should be rare, but if we haven't mapped the source, create it with no baseline.
-                        let i = Uuid::new_v4().to_string();
+            // Handle rename/move operations
+            if let FileChange::Update { move_path: Some(dest), .. } = change {
+                let uuid_filename = self.external_to_temp_name.get(path)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let id = Uuid::new_v4().to_string();
                         self.baseline_file_info.insert(
-                            i.clone(),
+                            id.clone(),
                             BaselineFileInfo {
                                 path: path.clone(),
-                                content: vec![],
+                                content: Vec::new(),
                                 mode: FileMode::Regular,
                                 oid: ZERO_OID.to_string(),
                             },
                         );
-                        i
-                    }
-                };
-                // Update current external mapping for temp file name.
-                self.temp_name_to_current_path
-                    .insert(uuid_filename.clone(), dest.clone());
-                // Update forward file_mapping: external current -> internal name.
+                        id
+                    });
+                
+                self.temp_name_to_current_path.insert(uuid_filename.clone(), dest.clone());
                 self.external_to_temp_name.remove(path);
-                self.external_to_temp_name
-                    .insert(dest.clone(), uuid_filename);
-            };
+                self.external_to_temp_name.insert(dest.clone(), uuid_filename);
+            }
         }
     }
 
@@ -145,46 +121,31 @@ impl TurnDiffTracker {
     /// Find the git worktree root for a file/directory by walking up to the first ancestor containing a `.git` entry.
     /// Uses a simple cache of known roots and avoids negative-result caching for simplicity.
     fn find_git_root_cached(&mut self, start: &Path) -> Option<PathBuf> {
-        let dir = if start.is_dir() {
-            start
-        } else {
-            start.parent()?
-        };
+        let dir = if start.is_dir() { start } else { start.parent()? };
 
-        // Fast path: if any cached root is an ancestor of this path, use it.
-        if let Some(root) = self
-            .git_root_cache
-            .iter()
-            .find(|r| dir.starts_with(r))
-            .cloned()
-        {
-            return Some(root);
+        // Fast path: check cache first
+        for root in &self.git_root_cache {
+            if dir.starts_with(root) {
+                return Some(root.clone());
+            }
         }
 
-        // Walk up to find a `.git` marker.
-        let mut cur = dir.to_path_buf();
+        // Walk up to find `.git` marker
+        let mut cur = dir;
         loop {
             let git_marker = cur.join(".git");
-            if git_marker.is_dir() || git_marker.is_file() {
-                if !self.git_root_cache.iter().any(|r| r == &cur) {
-                    self.git_root_cache.push(cur.clone());
-                }
-                return Some(cur);
+            if git_marker.exists() {
+                let root = cur.to_path_buf();
+                self.git_root_cache.push(root.clone());
+                return Some(root);
             }
 
-            // On Windows, avoid walking above the drive or UNC share root.
             #[cfg(windows)]
-            {
-                if is_windows_drive_or_unc_root(&cur) {
-                    return None;
-                }
-            }
-
-            if let Some(parent) = cur.parent() {
-                cur = parent.to_path_buf();
-            } else {
+            if is_windows_drive_or_unc_root(cur) {
                 return None;
             }
+
+            cur = cur.parent()?;
         }
     }
 
@@ -227,29 +188,31 @@ impl TurnDiffTracker {
     /// collected before the first time they were touched by apply_patch during this turn with
     /// the current repo state.
     pub fn get_unified_diff(&mut self) -> Result<Option<String>> {
-        let mut aggregated = String::new();
+        if self.baseline_file_info.is_empty() {
+            return Ok(None);
+        }
 
-        // Compute diffs per tracked internal file in a stable order by external path.
-        let mut baseline_file_names: Vec<String> =
-            self.baseline_file_info.keys().cloned().collect();
-        // Sort lexicographically by full repo-relative path to match git behavior.
-        baseline_file_names.sort_by_key(|internal| {
-            self.get_path_for_internal(internal)
-                .map(|p| self.relative_to_git_root_str(&p))
-                .unwrap_or_default()
-        });
+        // Sort files by repo-relative path for stable output
+        let mut file_entries: Vec<_> = self.baseline_file_info.keys()
+            .filter_map(|internal| {
+                self.get_path_for_internal(internal)
+                    .map(|p| (internal.clone(), self.relative_to_git_root_str(&p)))
+            })
+            .collect();
+        file_entries.sort_by(|a, b| a.1.cmp(&b.1));
 
-        for internal in baseline_file_names {
-            aggregated.push_str(self.get_file_diff(&internal).as_str());
-            if !aggregated.ends_with('\n') {
-                aggregated.push('\n');
+        let mut diffs = Vec::with_capacity(file_entries.len());
+        for (internal, _) in file_entries {
+            let diff = self.get_file_diff(&internal);
+            if !diff.is_empty() {
+                diffs.push(diff);
             }
         }
 
-        if aggregated.trim().is_empty() {
+        if diffs.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(aggregated))
+            Ok(Some(diffs.join("\n") + "\n"))
         }
     }
 
@@ -294,17 +257,9 @@ impl TurnDiffTracker {
         let right_display = self.relative_to_git_root_str(&current_external_path);
 
         // Compute right oid before borrowing baseline content.
-        let right_oid = if let Some(b) = right_bytes.as_ref() {
-            if current_mode == FileMode::Symlink {
-                format!("{:x}", git_blob_sha1_hex_bytes(b))
-            } else {
-                // Directly compute the blob id from bytes (same as git would). Avoid invoking
-                // git for each file; fall back to ZERO_OID only if bytes are absent (handled else).
-                format!("{:x}", git_blob_sha1_hex_bytes(b))
-            }
-        } else {
-            ZERO_OID.to_string()
-        };
+        let right_oid = right_bytes.as_ref()
+            .map(|b| format!("{:x}", git_blob_sha1_hex_bytes(b)))
+            .unwrap_or_else(|| ZERO_OID.to_string());
 
         // Borrow baseline content only after all &mut self uses are done.
         let left_present = left_oid.as_str() != ZERO_OID;

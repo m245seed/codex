@@ -1,8 +1,5 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Stdio;
-use tokio::process::Child;
-use tokio::process::Command;
+use std::{collections::HashMap, path::PathBuf, process::Stdio};
+use tokio::process::{Child, Command};
 use tracing::trace;
 
 use crate::protocol::SandboxPolicy;
@@ -50,11 +47,11 @@ pub(crate) async fn spawn_child_async(
 
     let mut cmd = Command::new(&program);
     #[cfg(unix)]
-    cmd.arg0(arg0.map_or_else(|| program.to_string_lossy().to_string(), String::from));
-    cmd.args(args);
-    cmd.current_dir(cwd);
-    cmd.env_clear();
-    cmd.envs(env);
+    cmd.arg0(arg0.unwrap_or_else(|| program.to_string_lossy().as_ref()));
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env);
 
     if !sandbox_policy.has_full_network_access() {
         cmd.env(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR, "1");
@@ -87,16 +84,11 @@ pub(crate) async fn spawn_child_async(
 
     match stdio_policy {
         StdioPolicy::RedirectForShellTool => {
-            // Do not create a file descriptor for stdin because otherwise some
-            // commands may hang forever waiting for input. For example, ripgrep has
-            // a heuristic where it may try to read from stdin as explained here:
-            // https://github.com/BurntSushi/ripgrep/blob/e2362d4d5185d02fa857bf381e7bd52e66fafc73/crates/core/flags/hiargs.rs#L1101-L1103
-            cmd.stdin(Stdio::null());
-
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
         }
         StdioPolicy::Inherit => {
-            // Inherit stdin, stdout, and stderr from the parent process.
             cmd.stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());

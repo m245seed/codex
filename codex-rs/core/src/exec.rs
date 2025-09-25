@@ -238,16 +238,13 @@ impl StreamOutput<String> {
 impl StreamOutput<Vec<u8>> {
     pub fn from_utf8_lossy(&self) -> StreamOutput<String> {
         StreamOutput {
-            text: String::from_utf8_lossy(&self.text).to_string(),
+            text: String::from_utf8_lossy(&self.text).into_owned(),
             truncated_after_lines: self.truncated_after_lines,
         }
     }
 }
 
-#[inline]
-fn append_all(dst: &mut Vec<u8>, src: &[u8]) {
-    dst.extend_from_slice(src);
-}
+
 
 #[derive(Debug)]
 pub struct ExecToolCallOutput {
@@ -354,7 +351,7 @@ async fn consume_truncated_output(
 
     let mut combined_buf = Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY);
     while let Ok(chunk) = agg_rx.recv().await {
-        append_all(&mut combined_buf, &chunk);
+        combined_buf.extend_from_slice(&chunk);
     }
     let aggregated_output = StreamOutput {
         text: combined_buf,
@@ -391,30 +388,29 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
         if let Some(stream) = &stream
             && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
         {
-            let chunk = tmp[..n].to_vec();
-            let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
-                call_id: stream.call_id.clone(),
-                stream: if is_stderr {
-                    ExecOutputStream::Stderr
-                } else {
-                    ExecOutputStream::Stdout
-                },
-                chunk,
-            });
             let event = Event {
                 id: stream.sub_id.clone(),
-                msg,
+                msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                    call_id: stream.call_id.clone(),
+                    stream: if is_stderr {
+                        ExecOutputStream::Stderr
+                    } else {
+                        ExecOutputStream::Stdout
+                    },
+                    chunk: chunk.to_vec(),
+                }),
             };
-            #[allow(clippy::let_unit_value)]
             let _ = stream.tx_event.send(event).await;
             emitted_deltas += 1;
         }
 
+        let chunk = &tmp[..n];
+        
         if let Some(tx) = &aggregate_tx {
-            let _ = tx.send(tmp[..n].to_vec()).await;
+            let _ = tx.send(chunk.to_vec()).await;
         }
 
-        append_all(&mut buf, &tmp[..n]);
+        buf.extend_from_slice(chunk);
         // Continue reading to EOF to avoid back-pressure
     }
 

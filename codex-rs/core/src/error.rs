@@ -1,11 +1,8 @@
 use crate::exec::ExecToolCallOutput;
-use crate::token_data::KnownPlan;
-use crate::token_data::PlanType;
+use crate::token_data::{KnownPlan, PlanType};
 use codex_protocol::mcp_protocol::ConversationId;
 use reqwest::StatusCode;
-use serde_json;
-use std::io;
-use std::time::Duration;
+use std::{io, time::Duration};
 use thiserror::Error;
 use tokio::task::JoinError;
 
@@ -139,33 +136,16 @@ pub struct UsageLimitReachedError {
 
 impl std::fmt::Display for UsageLimitReachedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self.plan_type.as_ref() {
-            Some(PlanType::Known(KnownPlan::Plus)) => format!(
-                "You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing){}",
-                retry_suffix_after_or(self.resets_in_seconds)
-            ),
-            Some(PlanType::Known(KnownPlan::Team)) | Some(PlanType::Known(KnownPlan::Business)) => {
-                format!(
-                    "You've hit your usage limit. To get more access now, send a request to your admin{}",
-                    retry_suffix_after_or(self.resets_in_seconds)
-                )
-            }
-            Some(PlanType::Known(KnownPlan::Free)) => {
-                "To use Codex with your ChatGPT plan, upgrade to Plus: https://openai.com/chatgpt/pricing."
-                    .to_string()
-            }
-            Some(PlanType::Known(KnownPlan::Pro))
-            | Some(PlanType::Known(KnownPlan::Enterprise))
-            | Some(PlanType::Known(KnownPlan::Edu)) => format!(
-                "You've hit your usage limit.{}",
-                retry_suffix(self.resets_in_seconds)
-            ),
-            Some(PlanType::Unknown(_)) | None => format!(
-                "You've hit your usage limit.{}",
-                retry_suffix(self.resets_in_seconds)
-            ),
+        let message = match &self.plan_type {
+            Some(PlanType::Known(KnownPlan::Plus)) => 
+                format!("You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing){}", retry_suffix_after_or(self.resets_in_seconds)),
+            Some(PlanType::Known(KnownPlan::Team | KnownPlan::Business)) => 
+                format!("You've hit your usage limit. To get more access now, send a request to your admin{}", retry_suffix_after_or(self.resets_in_seconds)),
+            Some(PlanType::Known(KnownPlan::Free)) => 
+                "To use Codex with your ChatGPT plan, upgrade to Plus: https://openai.com/chatgpt/pricing.".to_string(),
+            Some(PlanType::Known(KnownPlan::Pro | KnownPlan::Enterprise | KnownPlan::Edu)) | Some(PlanType::Unknown(_)) | None => 
+                format!("You've hit your usage limit.{}", retry_suffix(self.resets_in_seconds)),
         };
-
         write!(f, "{message}")
     }
 }
@@ -193,27 +173,22 @@ fn format_reset_duration(total_secs: u64) -> String {
     let hours = (total_secs % 86_400) / 3_600;
     let minutes = (total_secs % 3_600) / 60;
 
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts = Vec::with_capacity(3);
+    
     if days > 0 {
-        let unit = if days == 1 { "day" } else { "days" };
-        parts.push(format!("{days} {unit}"));
+        parts.push(format!("{} {}", days, if days == 1 { "day" } else { "days" }));
     }
     if hours > 0 {
-        let unit = if hours == 1 { "hour" } else { "hours" };
-        parts.push(format!("{hours} {unit}"));
+        parts.push(format!("{} {}", hours, if hours == 1 { "hour" } else { "hours" }));
     }
     if minutes > 0 {
-        let unit = if minutes == 1 { "minute" } else { "minutes" };
-        parts.push(format!("{minutes} {unit}"));
-    }
-
-    if parts.is_empty() {
-        return "less than a minute".to_string();
+        parts.push(format!("{} {}", minutes, if minutes == 1 { "minute" } else { "minutes" }));
     }
 
     match parts.len() {
-        1 => parts[0].clone(),
-        2 => format!("{} {}", parts[0], parts[1]),
+        0 => "less than a minute".to_string(),
+        1 => parts.into_iter().next().unwrap(),
+        2 => parts.join(" "),
         _ => format!("{} {} {}", parts[0], parts[1], parts[2]),
     }
 }
@@ -250,11 +225,8 @@ impl CodexErr {
 pub fn get_error_message_ui(e: &CodexErr) -> String {
     match e {
         CodexErr::Sandbox(SandboxErr::Denied { output }) => output.stderr.text.clone(),
-        // Timeouts are not sandbox errors from a UX perspective; present them plainly
-        CodexErr::Sandbox(SandboxErr::Timeout { output }) => format!(
-            "error: command timed out after {} ms",
-            output.duration.as_millis()
-        ),
+        CodexErr::Sandbox(SandboxErr::Timeout { output }) => 
+            format!("error: command timed out after {} ms", output.duration.as_millis()),
         _ => e.to_string(),
     }
 }

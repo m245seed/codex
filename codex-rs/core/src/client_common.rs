@@ -39,19 +39,11 @@ impl Prompt {
         let base = self
             .base_instructions_override
             .as_deref()
-            .unwrap_or(model.base_instructions.deref());
-        // When there are no custom instructions, add apply_patch_tool_instructions if:
-        // - the model needs special instructions (4.1)
-        // AND
-        // - there is no apply_patch tool present
-        let is_apply_patch_tool_present = self.tools.iter().any(|tool| match tool {
-            OpenAiTool::Function(f) => f.name == "apply_patch",
-            OpenAiTool::Freeform(f) => f.name == "apply_patch",
-            _ => false,
-        });
+            .unwrap_or(&model.base_instructions);
+        
         if self.base_instructions_override.is_none()
             && model.needs_special_apply_patch_instructions
-            && !is_apply_patch_tool_present
+            && !self.has_apply_patch_tool()
         {
             Cow::Owned(format!("{base}\n{APPLY_PATCH_TOOL_INSTRUCTIONS}"))
         } else {
@@ -59,8 +51,17 @@ impl Prompt {
         }
     }
 
-    pub(crate) fn get_formatted_input(&self) -> Vec<ResponseItem> {
-        self.input.clone()
+    fn has_apply_patch_tool(&self) -> bool {
+        self.tools.iter().any(|tool| {
+            matches!(tool, 
+                OpenAiTool::Function(f) | OpenAiTool::Freeform(f) 
+                if f.name == "apply_patch"
+            )
+        })
+    }
+
+    pub(crate) fn get_formatted_input(&self) -> &[ResponseItem] {
+        &self.input
     }
 }
 
@@ -125,7 +126,7 @@ pub(crate) struct ResponsesApiRequest<'a> {
     // TODO(mbolin): ResponseItem::Other should not be serialized. Currently,
     // we code defensively to avoid this case, but perhaps we should use a
     // separate enum for serialization.
-    pub(crate) input: &'a Vec<ResponseItem>,
+    pub(crate) input: &'a [ResponseItem],
     pub(crate) tools: &'a [serde_json::Value],
     pub(crate) tool_choice: &'static str,
     pub(crate) parallel_tool_calls: bool,
@@ -144,11 +145,7 @@ pub(crate) fn create_reasoning_param_for_request(
     effort: Option<ReasoningEffortConfig>,
     summary: ReasoningSummaryConfig,
 ) -> Option<Reasoning> {
-    if !model_family.supports_reasoning_summaries {
-        return None;
-    }
-
-    Some(Reasoning {
+    model_family.supports_reasoning_summaries.then_some(Reasoning {
         effort,
         summary: Some(summary),
     })
@@ -225,11 +222,11 @@ mod tests {
             let expected = if test_case.expects_apply_patch_instructions {
                 format!(
                     "{}\n{}",
-                    model_family.clone().base_instructions,
+                    model_family.base_instructions,
                     APPLY_PATCH_TOOL_INSTRUCTIONS
                 )
             } else {
-                model_family.clone().base_instructions
+                model_family.base_instructions.to_string()
             };
 
             let full = prompt.get_full_instructions(&model_family);
