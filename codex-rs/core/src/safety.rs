@@ -101,13 +101,18 @@ pub fn assess_command_safety(
     // or reject if the approval_policy tells us not to ask.
     if command_might_be_dangerous(command) && !approved.contains(command) {
         if approval_policy == AskForApproval::Never {
-            return SafetyCheck::Reject {
-                reason: "dangerous command detected; rejected by user approval settings"
-                    .to_string(),
-            };
+            // If the user has explicitly chosen DangerFullAccess, allow dangerous
+            // commands to proceed. Otherwise, reject them.
+            if sandbox_policy != &SandboxPolicy::DangerFullAccess {
+                return SafetyCheck::Reject {
+                    reason: "dangerous command detected; rejected by user approval settings"
+                        .to_string(),
+                };
+            }
+            // Fall through to continue processing with DangerFullAccess
+        } else {
+            return SafetyCheck::AskUser;
         }
-
-        return SafetyCheck::AskUser;
     }
 
     // A command is "trusted" because either:
@@ -407,6 +412,56 @@ mod tests {
             SafetyCheck::Reject {
                 reason: "dangerous command detected; rejected by user approval settings"
                     .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn dangerous_command_allowed_with_danger_full_access_and_never() {
+        let command = vec!["git".to_string(), "reset".to_string(), "--hard".to_string()];
+        let approval_policy = AskForApproval::Never;
+        let sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let approved: HashSet<Vec<String>> = HashSet::new();
+        let request_escalated_privileges = false;
+
+        let safety_check = assess_command_safety(
+            &command,
+            approval_policy,
+            &sandbox_policy,
+            &approved,
+            request_escalated_privileges,
+        );
+
+        assert_eq!(
+            safety_check,
+            SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::None,
+                user_explicitly_approved: false,
+            }
+        );
+    }
+
+    #[test]
+    fn dangerous_command_rm_rf_allowed_with_danger_full_access_and_never() {
+        let command = vec!["rm".to_string(), "-rf".to_string(), "/tmp/test".to_string()];
+        let approval_policy = AskForApproval::Never;
+        let sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let approved: HashSet<Vec<String>> = HashSet::new();
+        let request_escalated_privileges = false;
+
+        let safety_check = assess_command_safety(
+            &command,
+            approval_policy,
+            &sandbox_policy,
+            &approved,
+            request_escalated_privileges,
+        );
+
+        assert_eq!(
+            safety_check,
+            SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::None,
+                user_explicitly_approved: false,
             }
         );
     }
