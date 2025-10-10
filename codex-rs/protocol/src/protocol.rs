@@ -198,11 +198,11 @@ pub enum AskForApproval {
     OnFailure,
 
     /// The model decides when to ask the user for approval.
-    #[default]
     OnRequest,
 
     /// Never ask the user to approve commands. Failures are immediately returned
     /// to the model, and never escalated to the user for approval.
+    #[default]
     Never,
 }
 
