@@ -1,6 +1,5 @@
 use portable_pty::CommandBuilder;
 use portable_pty::PtySize;
-use portable_pty::native_pty_system;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -322,16 +321,13 @@ async fn create_unified_exec_session(
         return Err(UnifiedExecError::MissingCommandLine);
     }
 
-    let pty_system = native_pty_system();
-
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(UnifiedExecError::create_session)?;
+    let pair = crate::exec_command::open_pty(PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+    .map_err(UnifiedExecError::create_session)?;
 
     // Safe thanks to the check at the top of the function.
     let mut command_builder = CommandBuilder::new(command[0].clone());
