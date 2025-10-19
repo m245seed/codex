@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicU32;
 
 use portable_pty::CommandBuilder;
 use portable_pty::PtySize;
+use portable_pty::native_pty_system;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -241,8 +242,11 @@ async fn create_exec_command_session(
         login,
     } = params;
 
-    // Create a new pty using the native implementation for the platform.
-    let pair = crate::exec_command::open_pty(PtySize {
+    // Use the native pty implementation for the system
+    let pty_system = native_pty_system();
+
+    // Create a new pty
+    let pair = pty_system.openpty(PtySize {
         rows: 24,
         cols: 80,
         pixel_width: 0,
